@@ -170,7 +170,7 @@ fn load_tensor_named(file_bytes, model, tname)
     let mut _ltn_out = []
     let mut i = 0.0
     while i < count
-      let f = read_f32_le(file_bytes, offset + i * 4.0)
+      let f = read_f32_le_bytes(file_bytes, offset + i * 4.0)
       push(_ltn_out, f)
       i = i + 1.0
     end
@@ -233,7 +233,7 @@ fn load_embedding_row(file_bytes, model, token_id, n_embd)
     let mut row = []
     let mut i = 0.0
     while i < n_embd
-      let f = read_f32_le(file_bytes, row_offset + i * 4.0)
+      let f = read_f32_le_bytes(file_bytes, row_offset + i * 4.0)
       push(row, f)
       i = i + 1.0
     end

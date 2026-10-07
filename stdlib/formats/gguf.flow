@@ -105,7 +105,7 @@ fn read_u64_le(bytes, offset)
   return low
 end
 
-fn read_f32_le(bytes, offset)
+fn read_f32_le_bytes(bytes, offset)
   // IEEE 754 float32 from 4 bytes via bits_to_float builtin
   let u = read_u32_le(bytes, offset)
   return bits_to_float(u)
@@ -255,7 +255,7 @@ fn gguf_parse_kv(bytes, start_pos, kv_count, model)
       value = read_u64_le(bytes, pos)
       pos = pos + 8.0
     elif val_type == GGUF_TYPE_FLOAT32
-      value = read_f32_le(bytes, pos)
+      value = read_f32_le_bytes(bytes, pos)
       pos = pos + 4.0
     elif val_type == GGUF_TYPE_FLOAT64
       // Read as 8 bytes, skip (f64 not supported in OctoFlow f32 runtime)
