@@ -886,14 +886,8 @@ fn load_embedding_row_from_file(file_path, model, token_id, n_embd)
   end
 
   mem_free(off_buf)
-  print("WARNING: Unsupported embedding type {ttype}")
-  let mut zeros = []
-  let mut zi = 0.0
-  while zi < n_embd
-    push(zeros, 0.0)
-    zi = zi + 1.0
-  end
-  return zeros
+  assert(false, "load_embedding_row_from_file: no decoder for ggml type " + str(ttype) + " of " + emb_name + " (this path implements F32, F16, Q4_K and Q6_K)")
+  return []
 end
 
 // ── Generic tensor row loader ─────────────────────────────────────
@@ -1024,14 +1018,8 @@ fn load_tensor_row_from_file(file_path, model, tname, row_idx, row_size)
   end
 
   mem_free(off_buf)
-  print("WARNING: Unsupported type {ttype} for tensor {tname}")
-  let mut _trz = []
-  let mut _zi = 0.0
-  while _zi < row_size
-    push(_trz, 0.0)
-    _zi = _zi + 1.0
-  end
-  return _trz
+  assert(false, "load_tensor_row_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this path implements F32, F16, Q4_K and Q6_K)")
+  return []
 end
 
 // ══════════════════════════════════════════════════════════════════════
