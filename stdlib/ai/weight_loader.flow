@@ -443,6 +443,60 @@ fn dequant_q4k_block_m(buf, block_off)
   return _dq4_out
 end
 
+// ── MEM-based Q8_0 / Q5_0 / BF16 dequant ────────────────────────
+// Block layouts and value formulas were confirmed element-by-element against ggml's own
+// dequantization (an F32 re-quant of the same file), not from a recalled bit layout:
+//   q8_0  34 B: d(f16)@0, int8 qs[32]@2         value = d * qs[i]
+//   q5_0  22 B: d(f16)@0, u32 qh@2, qs[16]@6    lo nibbles of qs[0..15] -> elements 0..15,
+//                                                hi nibbles -> elements 16..31, 5th bit = bit i of qh
+//                                                value = (q - 16) * d
+// Both nibble schemes and the 5th-bit index were the surprising parts (plane-split, not paired).
+
+fn dequant_q8_0_block_m(buf, block_off)
+  let d = read_f16_le_m(buf, block_off)
+  let mut out = []
+  let mut i = 0.0
+  while i < 32.0
+    let raw = mem_get_u8(buf, block_off + 2.0 + i)
+    let sv = raw - floor(raw / 128.0) * 256.0
+    push(out, d * sv)
+    i = i + 1.0
+  end
+  return out
+end
+
+fn dequant_q5_0_block_m(buf, block_off)
+  let d = read_f16_le_m(buf, block_off)
+  let mut out = []
+  let mut i = 0.0
+  while i < 32.0
+    let mut qs_idx = i
+    if i >= 16.0
+      qs_idx = i - 16.0
+    end
+    let byte = mem_get_u8(buf, block_off + 6.0 + qs_idx)
+    let mut nib = byte - floor(byte / 16.0) * 16.0
+    if i >= 16.0
+      nib = floor(byte / 16.0)
+    end
+    // The 5th bit is bit (i mod 8) of the qh byte at (i div 8). Read and shifted per byte on
+    // purpose: numbers here are f32, so combining the four bytes into one word would discard the
+    // low bits of that word and silently drop the 5th bit for most elements.
+    let qh_idx = floor(i / 8.0)
+    let qbyte = mem_get_u8(buf, block_off + 2.0 + qh_idx)
+    let mut sh = i - 8.0 * qh_idx
+    let mut shifted = qbyte
+    while sh > 0.0
+      shifted = floor(shifted / 2.0)
+      sh = sh - 1.0
+    end
+    let bit = shifted - 2.0 * floor(shifted / 2.0)
+    let q = nib + 16.0 * bit
+    push(out, (q - 16.0) * d)
+    i = i + 1.0
+  end
+  return out
+end
 // ── Load tensor from file (no OOM) ──────────────────────────────
 // Reads raw bytes from GGUF file, dequants to f32 array.
 // Uses gguf_tensor_file_offset for u64-precise seeking.
@@ -484,6 +538,40 @@ fn load_tensor_from_file(file_path, model, tname)
       let f = read_f16_le_m(raw, i * 2.0)
       push(result, f)
       i = i + 1.0
+    end
+  elif ttype == 30.0
+    // BF16: one 16-bit value per element, exponent-biased like f32 with 8 bits of mantissa.
+    let mut i = 0.0
+    while i < count
+      let b0 = mem_get_u8(raw, i * 2.0)
+      let b1 = mem_get_u8(raw, i * 2.0 + 1.0)
+      let f = bits_to_float((b0 + b1 * 256.0) * 65536.0)
+      push(result, f)
+      i = i + 1.0
+    end
+  elif ttype == 8.0
+    // Q8_0: 32 weights from 34 bytes
+    let mut b = 0.0
+    while b < count / 32.0
+      let vals = dequant_q8_0_block_m(raw, b * 34.0)
+      let mut vi = 0.0
+      while vi < len(vals)
+        push(result, vals[int(vi)])
+        vi = vi + 1.0
+      end
+      b = b + 1.0
+    end
+  elif ttype == 6.0
+    // Q5_0: 32 weights from 22 bytes
+    let mut b = 0.0
+    while b < count / 32.0
+      let vals = dequant_q5_0_block_m(raw, b * 22.0)
+      let mut vi = 0.0
+      while vi < len(vals)
+        push(result, vals[int(vi)])
+        vi = vi + 1.0
+      end
+      b = b + 1.0
     end
   elif ttype == 12.0
     // Q4_K: inline dequant — no function calls to avoid O(n^2) clone overhead

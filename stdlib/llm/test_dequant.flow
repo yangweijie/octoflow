@@ -1,0 +1,102 @@
+// Verifies the new .flow block decoders against ggml's own dequantization.
+// Reference side: the F32 re-quant produced by llama-quantize, i.e. ggml's real decoder.
+// Statement-level bare blocks and ternaries are not part of this language, so the two checks are
+// written flat with distinct names rather than wrapped in a helper.
+use "gguf"
+use "weight_loader"
+
+let quant = "D:/OllamaModels/ermiaazarkhalili/Qwen2.5-0.5B-Instruct_Function_Calling_xLAM-GGUF/model-Q4_K_M.gguf"
+let oracle = "D:/git/python/ninfer/.octoflow_probe/qwen25-f32.gguf"
+
+let mut failures = 0.0
+let nblk = 64.0
+
+// ---- q5_0: blk.0.attn_q.weight, 22-byte blocks of 32 weights ----
+let q5_abs = 151232832.0
+let f5_abs = 554167616.0
+let q5buf = mem_alloc(22.0 * nblk)
+let _q5r = file_read_into_mem(quant, q5buf, q5_abs, 22.0 * nblk)
+let o5buf = mem_alloc(128.0 * nblk)
+let _o5r = file_read_into_mem(oracle, o5buf, f5_abs, 128.0 * nblk)
+let mut q5bad = 0.0
+let mut q5worst = 0.0
+let mut b5 = 0.0
+while b5 < nblk
+  let v5 = dequant_q5_0_block_m(q5buf, b5 * 22.0)
+  let mut i5 = 0.0
+  while i5 < 32.0
+    let got5 = v5[int(i5)]
+    let ref5 = bits_to_float(mem_get_u32(o5buf, (b5 * 32.0 + i5) * 4.0))
+    let mut d5 = got5 - ref5
+    if d5 < 0.0
+      d5 = d5 * -1.0
+    end
+    let mut m5 = ref5
+    if m5 < 0.0
+      m5 = m5 * -1.0
+    end
+    if d5 > m5 * 0.001 + 0.000000001
+      q5bad = q5bad + 1.0
+    end
+    if d5 > q5worst
+      q5worst = d5
+    end
+    i5 = i5 + 1.0
+  end
+  b5 = b5 + 1.0
+end
+mem_free(q5buf)
+mem_free(o5buf)
+let q5checked = 32.0 * nblk
+print("q5_0 attn_q: {q5bad} of {q5checked} outside tolerance, worst abs diff {q5worst}")
+if q5bad != 0.0
+  failures = failures + 1.0
+end
+
+// ---- q8_0: token_embd.weight, 34-byte blocks of 32 weights ----
+let q8_abs = 5951296.0
+let f8_abs = 5951296.0
+let q8buf = mem_alloc(34.0 * nblk)
+let _q8r = file_read_into_mem(quant, q8buf, q8_abs, 34.0 * nblk)
+let o8buf = mem_alloc(128.0 * nblk)
+let _o8r = file_read_into_mem(oracle, o8buf, f8_abs, 128.0 * nblk)
+let mut q8bad = 0.0
+let mut q8worst = 0.0
+let mut b8 = 0.0
+while b8 < nblk
+  let v8 = dequant_q8_0_block_m(q8buf, b8 * 34.0)
+  let mut i8 = 0.0
+  while i8 < 32.0
+    let got8 = v8[int(i8)]
+    let ref8 = bits_to_float(mem_get_u32(o8buf, (b8 * 32.0 + i8) * 4.0))
+    let mut d8 = got8 - ref8
+    if d8 < 0.0
+      d8 = d8 * -1.0
+    end
+    let mut m8 = ref8
+    if m8 < 0.0
+      m8 = m8 * -1.0
+    end
+    if d8 > m8 * 0.001 + 0.000000001
+      q8bad = q8bad + 1.0
+    end
+    if d8 > q8worst
+      q8worst = d8
+    end
+    i8 = i8 + 1.0
+  end
+  b8 = b8 + 1.0
+end
+mem_free(q8buf)
+mem_free(o8buf)
+let q8checked = 32.0 * nblk
+print("q8_0 token_embd: {q8bad} of {q8checked} outside tolerance, worst abs diff {q8worst}")
+if q8bad != 0.0
+  failures = failures + 1.0
+end
+
+if failures == 0.0
+  print("DEQUANT DECODERS MATCH THE GGML ORACLE")
+else
+  print("DECODER FAILURES: {failures}")
+end
