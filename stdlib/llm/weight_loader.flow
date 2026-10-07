@@ -8,10 +8,11 @@
 //
 // Supports:
 //   - F32 tensors (norm weights, small tensors)
-//   - F16 tensors (embedding, output)
+//   - F16, BF16 tensors (embedding, output)
 //   - Q4_K_M tensors (bulk weights) — CPU dequant, GPU dequant later
+//   - Q5_0, Q6_K, Q8_0 tensors (file-based functions only) — these three block layouts plus
+//     F32/F16/BF16 were checked element-by-element against an F32 re-quant of the same file
 //   - Q5_K tensors — use gguf_load_tensor() Rust builtin (v1.5.0+)
-//   - Q6_K tensors — file-based functions only (load_tensor_from_file, etc.)
 //
 // Functions:
 //   load_layer_weights(file_bytes, model, layer_idx) → weight map
@@ -497,6 +498,45 @@ fn dequant_q5_0_block_m(buf, block_off)
   end
   return out
 end
+
+// q6_K: 256 weights from 210 bytes. Element e draws its low nibble from
+// ql[64*ip + il + 32*(k mod 2)] (upper nibble when k >= 2) and its two high bits from
+// qh[32*ip + il] >> 2*k, with ip = e div 128, k = (e mod 128) div 32, il = (e mod 128) mod 32.
+// That scrambled mapping is ggml's to_q6_K; it was checked bit-exactly against an F32 re-quant.
+fn dequant_q6_k_block_m(buf, block_off)
+  let d = read_f16_le_m(buf, block_off + 208.0)
+  let mut out = []
+  let mut e = 0.0
+  while e < 256.0
+    let ip = floor(e / 128.0)
+    let r = e - 128.0 * ip
+    let k = floor(r / 32.0)
+    let il = r - 32.0 * k
+    let kb = k - 2.0 * floor(k / 2.0)
+    let cell = mem_get_u8(buf, block_off + 64.0 * ip + il + 32.0 * kb)
+    let mut q = cell - 16.0 * floor(cell / 16.0)
+    if k >= 2.0
+      q = floor(cell / 16.0)
+    end
+    // The two high bits are 2k..2k+1 of one qh byte. Divided out in f32 rather than assembled
+    // into a 32-bit word: words built from bytes would overflow the exact-integer range of f32.
+    let hib = mem_get_u8(buf, block_off + 128.0 + 32.0 * ip + il)
+    let mut div = 1.0
+    let mut sh = 0.0
+    while sh < k
+      div = div * 4.0
+      sh = sh + 1.0
+    end
+    let moved = floor(hib / div)
+    q = q + 16.0 * (moved - 4.0 * floor(moved / 4.0))
+    let sraw = mem_get_u8(buf, block_off + 192.0 + floor(e / 16.0))
+    let s = sraw - 256.0 * floor(sraw / 128.0)
+    push(out, d * s * (q - 32.0))
+    e = e + 1.0
+  end
+  return out
+end
+
 // ── Load tensor from file (no OOM) ──────────────────────────────
 // Reads raw bytes from GGUF file, dequants to f32 array.
 // Uses gguf_tensor_file_offset for u64-precise seeking.
@@ -680,113 +720,24 @@ fn load_tensor_from_file(file_path, model, tname)
       b = b + 1.0
     end
   elif ttype == 14.0
-    // Q6_K: inline dequant — 256 elements per block, 210 bytes
-    // Layout: ql(128B) + qh(64B) + scales(16B int8) + d(f16,2B)
-    let block_size6 = 256.0
-    let block_bytes6 = 210.0
-    let n_blocks6 = ceil(count / block_size6)
+    // Q6_K: 256 weights per 210-byte block, count may end mid-block
     let mut b6 = 0.0
-    while b6 < n_blocks6
-      let bo6 = b6 * block_bytes6
-      // Decode d (f16) — at END of block (bytes 208-209)
-      let d6b0 = mem_get_u8(raw, bo6 + 208.0)
-      let d6b1 = mem_get_u8(raw, bo6 + 209.0)
-      let d6_bits = d6b0 + d6b1 * 256.0
-      let d6_sign = floor(d6_bits / 32768.0)
-      let d6_rem = d6_bits - d6_sign * 32768.0
-      let d6_exp = floor(d6_rem / 1024.0)
-      let d6_man = d6_rem - d6_exp * 1024.0
-      let mut d6v = 0.0
-      if d6_exp > 0.0
-        if d6_exp < 31.0
-          d6v = (1.0 + d6_man / 1024.0) * pow(2.0, d6_exp - 15.0)
-          if d6_sign == 1.0
-            d6v = d6v * -1.0
-          end
-        end
+    while b6 < ceil(count / 256.0)
+      let vals6 = dequant_q6_k_block_m(raw, b6 * 210.0)
+      let mut n6 = 256.0
+      let left6 = count - b6 * 256.0
+      if left6 < n6
+        n6 = left6
       end
-      let ql6 = bo6
-      let qh6 = bo6 + 128.0
-      let sc6 = bo6 + 192.0
-      // Pre-allocate block output
-      let mut _b6o = []
-      let mut _f6 = 0.0
-      while _f6 < 256.0
-        push(_b6o, 0.0)
-        _f6 = _f6 + 1.0
-      end
-      // 2 halves of 128
-      let mut h6 = 0.0
-      while h6 < 2.0
-        let hb6 = h6 * 128.0
-        let ql6o = ql6 + h6 * 64.0
-        let qh6o = qh6 + h6 * 32.0
-        let sc6o = sc6 + h6 * 8.0
-        let mut l6 = 0.0
-        while l6 < 32.0
-          let qla6 = mem_get_u8(raw, ql6o + l6)
-          let qlb6 = mem_get_u8(raw, ql6o + l6 + 32.0)
-          let qhv6 = mem_get_u8(raw, qh6o + l6)
-          // is = l/16 selects which sub-block scale pair to use
-          let is6 = floor(l6 / 16.0)
-          // Scales (signed int8) — indexed by is6 offset
-          let r0 = mem_get_u8(raw, sc6o + is6)
-          let mut sv0 = r0
-          if sv0 > 127.0
-            sv0 = sv0 - 256.0
-          end
-          let r2 = mem_get_u8(raw, sc6o + is6 + 2.0)
-          let mut sv2 = r2
-          if sv2 > 127.0
-            sv2 = sv2 - 256.0
-          end
-          let r4 = mem_get_u8(raw, sc6o + is6 + 4.0)
-          let mut sv4 = r4
-          if sv4 > 127.0
-            sv4 = sv4 - 256.0
-          end
-          let r6 = mem_get_u8(raw, sc6o + is6 + 6.0)
-          let mut sv6 = r6
-          if sv6 > 127.0
-            sv6 = sv6 - 256.0
-          end
-          // q1: pos l — ql lower nibble, qh bits 0-1
-          let q61_lo = qla6 - floor(qla6 / 16.0) * 16.0
-          let q61_hi = qhv6 - floor(qhv6 / 4.0) * 4.0
-          _b6o[int(hb6 + l6)] = d6v * sv0 * ((q61_lo + q61_hi * 16.0) - 32.0)
-          // q2: pos l+32 — ql[+32] lower nibble, qh bits 2-3
-          let q62_lo = qlb6 - floor(qlb6 / 16.0) * 16.0
-          let qhs2 = floor(qhv6 / 4.0)
-          let q62_hi = qhs2 - floor(qhs2 / 4.0) * 4.0
-          _b6o[int(hb6 + l6 + 32.0)] = d6v * sv2 * ((q62_lo + q62_hi * 16.0) - 32.0)
-          // q3: pos l+64 — ql upper nibble, qh bits 4-5
-          let q63_lo = floor(qla6 / 16.0)
-          let qhs4 = floor(qhv6 / 16.0)
-          let q63_hi = qhs4 - floor(qhs4 / 4.0) * 4.0
-          _b6o[int(hb6 + l6 + 64.0)] = d6v * sv4 * ((q63_lo + q63_hi * 16.0) - 32.0)
-          // q4: pos l+96 — ql[+32] upper nibble, qh bits 6-7
-          let q64_lo = floor(qlb6 / 16.0)
-          let q64_hi = floor(qhv6 / 64.0)
-          _b6o[int(hb6 + l6 + 96.0)] = d6v * sv6 * ((q64_lo + q64_hi * 16.0) - 32.0)
-          l6 = l6 + 1.0
-        end
-        h6 = h6 + 1.0
-      end
-      // Copy block to result (handle partial last block)
-      let rem6 = count - b6 * block_size6
-      let mut cc6 = block_size6
-      if rem6 < cc6
-        cc6 = rem6
-      end
-      let mut ci6 = 0.0
-      while ci6 < cc6
-        push(result, _b6o[int(ci6)])
-        ci6 = ci6 + 1.0
+      let mut vi6 = 0.0
+      while vi6 < n6
+        push(result, vals6[int(vi6)])
+        vi6 = vi6 + 1.0
       end
       b6 = b6 + 1.0
     end
   else
-    assert(false, "load_tensor_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16 and Q4_K)")
+    assert(false, "load_tensor_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16, BF16, Q8_0, Q5_0, Q4_K and Q6_K)")
   end
 
   mem_free(raw)
@@ -901,133 +852,30 @@ fn load_embedding_row_from_file(file_path, model, token_id, n_embd)
     end
     return row
   elif ttype == 14.0
-    // Q6_K: 256 elements per block, 210 bytes per block
-    // Layout: ql(128B) + qh(64B) + scales(16B int8) + d(f16,2B) = 210
-    let block_size = 256.0
-    let block_bytes = 210.0
+    let q6_block_bytes = 210.0
     let weight_idx = token_id * n_embd
-    let block_idx = floor(weight_idx / block_size)
-    let weights_end = weight_idx + n_embd
-    let blocks_needed = ceil((weights_end - block_idx * block_size) / block_size)
-
-    let read_bytes_count = blocks_needed * block_bytes
-    let block_byte_off = block_idx * block_bytes
+    let block_idx = floor(weight_idx / 256.0)
+    let blocks_needed = ceil((weight_idx + n_embd - block_idx * 256.0) / 256.0)
     let blk_off = mem_alloc(8)
-    mem_set_u64(blk_off, 0.0, block_byte_off)
+    mem_set_u64(blk_off, 0.0, block_idx * q6_block_bytes)
     let _a = mem_u64_add(off_buf, 0.0, blk_off, 0.0)
     mem_free(blk_off)
-
-    let raw = mem_alloc(read_bytes_count)
-    let _rd = file_read_into_mem_u64(file_path, raw, off_buf, 0.0, read_bytes_count)
+    let raw = mem_alloc(blocks_needed * q6_block_bytes)
+    let _rd = file_read_into_mem_u64(file_path, raw, off_buf, 0.0, blocks_needed * q6_block_bytes)
     mem_free(off_buf)
-
-    // Inline Q6_K dequant for all needed blocks
     let mut all_weights = []
     let mut blki = 0.0
     while blki < blocks_needed
-      let bo = blki * block_bytes
-      // Decode d (f16) — at END of block (bytes 208-209)
-      let d6b0 = mem_get_u8(raw, bo + 208.0)
-      let d6b1 = mem_get_u8(raw, bo + 209.0)
-      let d6_bits = d6b0 + d6b1 * 256.0
-      let d6_sign = floor(d6_bits / 32768.0)
-      let d6_rem = d6_bits - d6_sign * 32768.0
-      let d6_exp = floor(d6_rem / 1024.0)
-      let d6_man = d6_rem - d6_exp * 1024.0
-      let mut d6 = 0.0
-      if d6_exp > 0.0
-        if d6_exp < 31.0
-          d6 = (1.0 + d6_man / 1024.0) * pow(2.0, d6_exp - 15.0)
-          if d6_sign == 1.0
-            d6 = d6 * -1.0
-          end
-        end
-      end
-      let ql_base = bo
-      let qh_base = bo + 128.0
-      let sc_base = bo + 192.0
-
-      // Pre-allocate 256-element block output (indexed writes for correct order)
-      let mut _blk6 = []
-      let mut _fi = 0.0
-      while _fi < 256.0
-        push(_blk6, 0.0)
-        _fi = _fi + 1.0
-      end
-
-      // Process 256 elements in 2 halves of 128
-      let mut half = 0.0
-      while half < 2.0
-        let hbase = half * 128.0
-        let ql_off = ql_base + half * 64.0
-        let qh_off = qh_base + half * 32.0
-        let sc_off = sc_base + half * 8.0
-        let mut l = 0.0
-        while l < 32.0
-          let ql_a = mem_get_u8(raw, ql_off + l)
-          let ql_b = mem_get_u8(raw, ql_off + l + 32.0)
-          let qh_v = mem_get_u8(raw, qh_off + l)
-          // is = l/16 selects which sub-block scale pair to use
-          let is6 = floor(l / 16.0)
-          // Decode scales (signed int8) — indexed by is6 offset
-          let sc0r = mem_get_u8(raw, sc_off + is6)
-          let mut s0 = sc0r
-          if s0 > 127.0
-            s0 = s0 - 256.0
-          end
-          let sc2r = mem_get_u8(raw, sc_off + is6 + 2.0)
-          let mut s2 = sc2r
-          if s2 > 127.0
-            s2 = s2 - 256.0
-          end
-          let sc4r = mem_get_u8(raw, sc_off + is6 + 4.0)
-          let mut s4 = sc4r
-          if s4 > 127.0
-            s4 = s4 - 256.0
-          end
-          let sc6r = mem_get_u8(raw, sc_off + is6 + 6.0)
-          let mut s6 = sc6r
-          if s6 > 127.0
-            s6 = s6 - 256.0
-          end
-          // q1: low nibble ql[l] + bits 0-1 of qh → position l
-          let q1_lo = ql_a - floor(ql_a / 16.0) * 16.0
-          let q1_hi = qh_v - floor(qh_v / 4.0) * 4.0
-          let q1 = (q1_lo + q1_hi * 16.0) - 32.0
-          _blk6[int(hbase + l)] = d6 * s0 * q1
-          // q2: low nibble ql[l+32] + bits 2-3 of qh → position l+32
-          let q2_lo = ql_b - floor(ql_b / 16.0) * 16.0
-          let qh_s2 = floor(qh_v / 4.0)
-          let q2_hi = qh_s2 - floor(qh_s2 / 4.0) * 4.0
-          let q2 = (q2_lo + q2_hi * 16.0) - 32.0
-          _blk6[int(hbase + l + 32.0)] = d6 * s2 * q2
-          // q3: high nibble ql[l] + bits 4-5 of qh → position l+64
-          let q3_lo = floor(ql_a / 16.0)
-          let qh_s4 = floor(qh_v / 16.0)
-          let q3_hi = qh_s4 - floor(qh_s4 / 4.0) * 4.0
-          let q3 = (q3_lo + q3_hi * 16.0) - 32.0
-          _blk6[int(hbase + l + 64.0)] = d6 * s4 * q3
-          // q4: high nibble ql[l+32] + bits 6-7 of qh → position l+96
-          let q4_lo = floor(ql_b / 16.0)
-          let q4_hi = floor(qh_v / 64.0)
-          let q4 = (q4_lo + q4_hi * 16.0) - 32.0
-          _blk6[int(hbase + l + 96.0)] = d6 * s6 * q4
-          l = l + 1.0
-        end
-        half = half + 1.0
-      end
-
-      // Copy block to all_weights
-      let mut _bi6 = 0.0
-      while _bi6 < 256.0
-        push(all_weights, _blk6[int(_bi6)])
-        _bi6 = _bi6 + 1.0
+      let vals6 = dequant_q6_k_block_m(raw, blki * q6_block_bytes)
+      let mut vi6 = 0.0
+      while vi6 < 256.0
+        push(all_weights, vals6[int(vi6)])
+        vi6 = vi6 + 1.0
       end
       blki = blki + 1.0
     end
     mem_free(raw)
-
-    let local_start = weight_idx - block_idx * block_size
+    let local_start = weight_idx - block_idx * 256.0
     let mut row = []
     let mut i = 0.0
     while i < n_embd
@@ -1142,112 +990,30 @@ fn load_tensor_row_from_file(file_path, model, tname, row_idx, row_size)
     end
     return _trf
   elif ttype == 14.0
-    let block_size = 256.0
-    let block_bytes = 210.0
+    let q6_block_bytes = 210.0
     let weight_idx = row_idx * row_size
-    let block_idx = floor(weight_idx / block_size)
-    let weights_end = weight_idx + row_size
-    let blocks_needed = ceil((weights_end - block_idx * block_size) / block_size)
-    let read_bytes_count = blocks_needed * block_bytes
-    let block_byte_off = block_idx * block_bytes
+    let block_idx = floor(weight_idx / 256.0)
+    let blocks_needed = ceil((weight_idx + row_size - block_idx * 256.0) / 256.0)
     let blk_off = mem_alloc(8)
-    mem_set_u64(blk_off, 0.0, block_byte_off)
+    mem_set_u64(blk_off, 0.0, block_idx * q6_block_bytes)
     let _a = mem_u64_add(off_buf, 0.0, blk_off, 0.0)
     mem_free(blk_off)
-    let raw = mem_alloc(read_bytes_count)
-    let _rd = file_read_into_mem_u64(file_path, raw, off_buf, 0.0, read_bytes_count)
+    let raw = mem_alloc(blocks_needed * q6_block_bytes)
+    let _rd = file_read_into_mem_u64(file_path, raw, off_buf, 0.0, blocks_needed * q6_block_bytes)
     mem_free(off_buf)
     let mut _trw = []
     let mut blki = 0.0
     while blki < blocks_needed
-      let bo = blki * block_bytes
-      let d6b0 = mem_get_u8(raw, bo)
-      let d6b1 = mem_get_u8(raw, bo + 1.0)
-      let d6_bits = d6b0 + d6b1 * 256.0
-      let d6_sign = floor(d6_bits / 32768.0)
-      let d6_rem = d6_bits - d6_sign * 32768.0
-      let d6_exp = floor(d6_rem / 1024.0)
-      let d6_man = d6_rem - d6_exp * 1024.0
-      let mut d6 = 0.0
-      if d6_exp > 0.0
-        if d6_exp < 31.0
-          d6 = (1.0 + d6_man / 1024.0) * pow(2.0, d6_exp - 15.0)
-          if d6_sign == 1.0
-            d6 = d6 * -1.0
-          end
-        end
-      end
-      let ql_base = bo + 2.0
-      let qh_base = bo + 130.0
-      let sc_base = bo + 194.0
-      let mut _blk6 = []
-      let mut _fi = 0.0
-      while _fi < 256.0
-        push(_blk6, 0.0)
-        _fi = _fi + 1.0
-      end
-      let mut half = 0.0
-      while half < 2.0
-        let hbase = half * 128.0
-        let ql_off = ql_base + half * 64.0
-        let qh_off = qh_base + half * 32.0
-        let sc_off = sc_base + half * 8.0
-        let mut l = 0.0
-        while l < 32.0
-          let ql_a = mem_get_u8(raw, ql_off + l)
-          let ql_b = mem_get_u8(raw, ql_off + l + 32.0)
-          let qh_v = mem_get_u8(raw, qh_off + l)
-          let sc0r = mem_get_u8(raw, sc_off)
-          let mut s0 = sc0r
-          if s0 > 127.0
-            s0 = s0 - 256.0
-          end
-          let sc2r = mem_get_u8(raw, sc_off + 2.0)
-          let mut s2 = sc2r
-          if s2 > 127.0
-            s2 = s2 - 256.0
-          end
-          let sc4r = mem_get_u8(raw, sc_off + 4.0)
-          let mut s4 = sc4r
-          if s4 > 127.0
-            s4 = s4 - 256.0
-          end
-          let sc6r = mem_get_u8(raw, sc_off + 6.0)
-          let mut s6 = sc6r
-          if s6 > 127.0
-            s6 = s6 - 256.0
-          end
-          let q1_lo = ql_a - floor(ql_a / 16.0) * 16.0
-          let q1_hi = qh_v - floor(qh_v / 4.0) * 4.0
-          let q1 = (q1_lo + q1_hi * 16.0) - 32.0
-          _blk6[int(hbase + l)] = d6 * s0 * q1
-          let q2_lo = ql_b - floor(ql_b / 16.0) * 16.0
-          let qh_s2 = floor(qh_v / 4.0)
-          let q2_hi = qh_s2 - floor(qh_s2 / 4.0) * 4.0
-          let q2 = (q2_lo + q2_hi * 16.0) - 32.0
-          _blk6[int(hbase + l + 32.0)] = d6 * s2 * q2
-          let q3_lo = floor(ql_a / 16.0)
-          let qh_s4 = floor(qh_v / 16.0)
-          let q3_hi = qh_s4 - floor(qh_s4 / 4.0) * 4.0
-          let q3 = (q3_lo + q3_hi * 16.0) - 32.0
-          _blk6[int(hbase + l + 64.0)] = d6 * s4 * q3
-          let q4_lo = floor(ql_b / 16.0)
-          let q4_hi = floor(qh_v / 64.0)
-          let q4 = (q4_lo + q4_hi * 16.0) - 32.0
-          _blk6[int(hbase + l + 96.0)] = d6 * s6 * q4
-          l = l + 1.0
-        end
-        half = half + 1.0
-      end
-      let mut _bi6 = 0.0
-      while _bi6 < 256.0
-        push(_trw, _blk6[int(_bi6)])
-        _bi6 = _bi6 + 1.0
+      let vals6 = dequant_q6_k_block_m(raw, blki * q6_block_bytes)
+      let mut vi6 = 0.0
+      while vi6 < 256.0
+        push(_trw, vals6[int(vi6)])
+        vi6 = vi6 + 1.0
       end
       blki = blki + 1.0
     end
     mem_free(raw)
-    let local_start = weight_idx - block_idx * block_size
+    let local_start = weight_idx - block_idx * 256.0
     let mut _trf = []
     let mut _ti = 0.0
     while _ti < row_size
