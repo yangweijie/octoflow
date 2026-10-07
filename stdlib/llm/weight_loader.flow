@@ -183,16 +183,10 @@ fn load_tensor_named(file_bytes, model, tname)
     return dequant_q4k_tensor(file_bytes, offset, count)
   end
 
-  // Unsupported type — return zeros
-  // Q5_K (type 13) and Q6_K (type 14) require gguf_load_tensor() Rust builtin
-  print("WARNING: Unsupported tensor type {ttype} for {tname} — use gguf_load_tensor() for Q5_K/Q6_K")
-  let mut _ltn_zeros = []
-  let mut i2 = 0.0
-  while i2 < count
-    push(_ltn_zeros, 0.0)
-    i2 = i2 + 1.0
-  end
-  return _ltn_zeros
+  // No decoder exists for this type. Zeros would reach the caller as a correctly shaped weight
+  // carrying no information, which is the failure mode this loader must not hide.
+  assert(false, "load_tensor_named: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16 and Q4_K)")
+  return []
 end
 
 // ── Tensor Name Builder ────────────────────────────────────────
@@ -704,12 +698,7 @@ fn load_tensor_from_file(file_path, model, tname)
       b6 = b6 + 1.0
     end
   else
-    print("WARNING: Unsupported tensor type {ttype}")
-    let mut i = 0.0
-    while i < count
-      push(result, 0.0)
-      i = i + 1.0
-    end
+    assert(false, "load_tensor_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16 and Q4_K)")
   end
 
   mem_free(raw)
