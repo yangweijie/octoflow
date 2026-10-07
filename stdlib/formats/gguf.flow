@@ -46,18 +46,42 @@ let GGUF_TYPE_UINT64  = 10.0
 let GGUF_TYPE_INT64   = 11.0
 let GGUF_TYPE_FLOAT64 = 12.0
 
-// GGUF tensor types (quantization formats)
-let GGUF_TENSOR_F32  = 0.0
-let GGUF_TENSOR_F16  = 1.0
-let GGUF_TENSOR_Q4_0 = 2.0
-let GGUF_TENSOR_Q4_1 = 3.0
-let GGUF_TENSOR_Q5_0 = 6.0
-let GGUF_TENSOR_Q5_1 = 7.0
-let GGUF_TENSOR_Q8_0 = 8.0
-let GGUF_TENSOR_Q8_1 = 9.0
-let GGUF_TENSOR_Q4_K = 12.0          // Q4_K_M (most common for small models)
-let GGUF_TENSOR_Q5_K = 13.0
-let GGUF_TENSOR_Q6_K = 14.0
+// GGUF tensor types (quantization formats), numbered as ggml's own enum.
+let GGUF_TENSOR_F32     = 0.0
+let GGUF_TENSOR_F16     = 1.0
+let GGUF_TENSOR_Q4_0    = 2.0
+let GGUF_TENSOR_Q4_1    = 3.0
+let GGUF_TENSOR_Q5_0    = 6.0
+let GGUF_TENSOR_Q5_1    = 7.0
+let GGUF_TENSOR_Q8_0    = 8.0
+let GGUF_TENSOR_Q8_1    = 9.0
+let GGUF_TENSOR_Q2_K    = 10.0
+let GGUF_TENSOR_Q3_K    = 11.0
+let GGUF_TENSOR_Q4_K    = 12.0         // Q4_K_M (most common for small models)
+let GGUF_TENSOR_Q5_K    = 13.0
+let GGUF_TENSOR_Q6_K    = 14.0
+let GGUF_TENSOR_Q8_K    = 15.0
+let GGUF_TENSOR_IQ2_XXS = 16.0
+let GGUF_TENSOR_IQ2_XS  = 17.0
+let GGUF_TENSOR_IQ3_XXS = 18.0
+let GGUF_TENSOR_IQ1_S   = 19.0
+let GGUF_TENSOR_IQ4_NL  = 20.0
+let GGUF_TENSOR_IQ3_S   = 21.0
+let GGUF_TENSOR_IQ2_S   = 22.0
+let GGUF_TENSOR_IQ4_XS  = 23.0
+let GGUF_TENSOR_I8      = 24.0
+let GGUF_TENSOR_I16     = 25.0
+let GGUF_TENSOR_I32     = 26.0
+let GGUF_TENSOR_I64     = 27.0
+let GGUF_TENSOR_F64     = 28.0
+let GGUF_TENSOR_IQ1_M   = 29.0
+let GGUF_TENSOR_BF16    = 30.0
+let GGUF_TENSOR_TQ1_0   = 34.0
+let GGUF_TENSOR_TQ2_0   = 35.0
+let GGUF_TENSOR_MXFP4   = 39.0
+let GGUF_TENSOR_NVFP4   = 40.0
+let GGUF_TENSOR_Q1_0    = 41.0
+let GGUF_TENSOR_Q2_0    = 42.0
 
 // ── Helper: Read bytes as little-endian values ──────────────────────
 
@@ -726,32 +750,82 @@ end
 
 // ── Tensor byte size helper ──────────────────────────────────────
 
+// Elements per block and bytes per block for one ggml tensor type, taken from ggml's own
+// blck_size / type_size table. An empty result means the type is unknown to this parser, and the
+// caller reports it rather than guessing a size.
+fn gguf_type_geometry(ttype)
+  if ttype == GGUF_TENSOR_F32 || ttype == GGUF_TENSOR_I32
+    return [1.0, 4.0]
+  elif ttype == GGUF_TENSOR_F16 || ttype == GGUF_TENSOR_BF16 || ttype == GGUF_TENSOR_I16
+    return [1.0, 2.0]
+  elif ttype == GGUF_TENSOR_I8
+    return [1.0, 1.0]
+  elif ttype == GGUF_TENSOR_I64 || ttype == GGUF_TENSOR_F64
+    return [1.0, 8.0]
+  elif ttype == GGUF_TENSOR_Q4_0 || ttype == GGUF_TENSOR_IQ4_NL
+    return [32.0, 18.0]
+  elif ttype == GGUF_TENSOR_Q4_1
+    return [32.0, 20.0]
+  elif ttype == GGUF_TENSOR_Q5_0
+    return [32.0, 22.0]
+  elif ttype == GGUF_TENSOR_Q5_1
+    return [32.0, 24.0]
+  elif ttype == GGUF_TENSOR_Q8_0
+    return [32.0, 34.0]
+  elif ttype == GGUF_TENSOR_Q8_1
+    return [32.0, 36.0]
+  elif ttype == GGUF_TENSOR_MXFP4
+    return [32.0, 17.0]
+  elif ttype == GGUF_TENSOR_Q2_0
+    return [64.0, 18.0]
+  elif ttype == GGUF_TENSOR_NVFP4
+    return [64.0, 36.0]
+  elif ttype == GGUF_TENSOR_Q1_0
+    return [128.0, 18.0]
+  elif ttype == GGUF_TENSOR_Q2_K
+    return [256.0, 84.0]
+  elif ttype == GGUF_TENSOR_Q3_K || ttype == GGUF_TENSOR_IQ3_S
+    return [256.0, 110.0]
+  elif ttype == GGUF_TENSOR_Q4_K
+    return [256.0, 144.0]
+  elif ttype == GGUF_TENSOR_Q5_K
+    return [256.0, 176.0]
+  elif ttype == GGUF_TENSOR_Q6_K
+    return [256.0, 210.0]
+  elif ttype == GGUF_TENSOR_Q8_K
+    return [256.0, 292.0]
+  elif ttype == GGUF_TENSOR_IQ2_XXS || ttype == GGUF_TENSOR_TQ2_0
+    return [256.0, 66.0]
+  elif ttype == GGUF_TENSOR_IQ2_XS
+    return [256.0, 74.0]
+  elif ttype == GGUF_TENSOR_IQ3_XXS
+    return [256.0, 98.0]
+  elif ttype == GGUF_TENSOR_IQ1_S
+    return [256.0, 50.0]
+  elif ttype == GGUF_TENSOR_IQ2_S
+    return [256.0, 82.0]
+  elif ttype == GGUF_TENSOR_IQ4_XS
+    return [256.0, 136.0]
+  elif ttype == GGUF_TENSOR_IQ1_M
+    return [256.0, 56.0]
+  elif ttype == GGUF_TENSOR_TQ1_0
+    return [256.0, 54.0]
+  end
+  return []
+end
+
 fn gguf_tensor_byte_size(model, tname)
   let ttype = gguf_tensor_type(model, tname)
   let count = gguf_tensor_count(model, tname)
-  if ttype == GGUF_TENSOR_F32
-    return count * 4.0
-  elif ttype == GGUF_TENSOR_F16
-    return count * 2.0
-  elif ttype == GGUF_TENSOR_Q4_K
-    // Q4_K: 256 elements per block, 144 bytes per block
-    let n_blocks = count / 256.0
-    return n_blocks * 144.0
-  elif ttype == GGUF_TENSOR_Q5_K
-    let n_blocks = count / 256.0
-    return n_blocks * 176.0
-  elif ttype == GGUF_TENSOR_Q6_K
-    let n_blocks = count / 256.0
-    return n_blocks * 210.0
-  elif ttype == GGUF_TENSOR_Q8_0
-    let n_blocks = count / 32.0
-    return n_blocks * 34.0
-  elif ttype == GGUF_TENSOR_Q4_0
-    let n_blocks = count / 32.0
-    return n_blocks * 18.0
-  end
-  // Default: assume F32
-  return count * 4.0
+  let geometry = gguf_type_geometry(ttype)
+  let type_text = str(ttype)
+  assert(len(geometry) == 2.0, "gguf_tensor_byte_size: " + tname + " has ggml type " + type_text + ", which this parser cannot size")
+  let block_elems = geometry[0.0]
+  let block_bytes = geometry[1.0]
+  let remainder = count % block_elems
+  // ggml requires a whole number of blocks in a row; a remainder would silently truncate the size.
+  assert(remainder == 0.0, "gguf_tensor_byte_size: " + tname + " holds " + str(count) + " elements, not a multiple of the " + str(block_elems) + "-element block of ggml type " + type_text)
+  return count / block_elems * block_bytes
 end
 
 // ── Get precise u64 file offset for a tensor ─────────────────────
