@@ -13,8 +13,8 @@
 // Uses FLAT key API from gguf.flow — no nested maps.
 // Tensor info stored as: t.NAME.type, t.NAME.offset, t.NAME.count, etc.
 //
-// Decodes: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q4_K, Q5_K, Q6_K, TQ1_0, TQ2_0 and
-// Q2_0_g128 (PQ2_0). Every block layout was checked
+// Decodes: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
+// TQ1_0, TQ2_0 and Q2_0_g128 (PQ2_0). Every block layout was checked
 // element-by-element against ggml's own dequantization: stdlib/llm/test_dequant.flow for Q5_0,
 // Q8_0 and Q6_K, stdlib/llm/test_dequant_more.flow for Q4_0, Q4_1, Q5_1 and Q5_K.
 // Anything else, Q5_K and the IQ family included, stops with a message naming the tensor and its
@@ -478,6 +478,90 @@ fn dequant_q2_0_g128_block_m(buf, block_off)
   return g1_out
 end
 
+// ── MEM-based Q3_K dequant ───────────────────────────────────────
+// ggml unpacks q3_K's twelve scale bytes into sixteen 6-bit scales through 32-bit words. Numbers
+// here are f32, so that word play is reproduced byte-wise instead: for output scale (W, k) with
+// W = idx div 4 and k = idx mod 4, the low nibble comes from scales[(W mod 2)*4 + k] for W = 0,1
+// and its high nibble from the same byte for W = 2,3, and the two extension bits sit at positions
+// 2W and 2W+1 of scales[8 + k]. 2W never exceeds 6, so the pair never straddles a byte boundary.
+fn q3k_scale_at(buf, sc_off, idx)
+  let qsa_w = floor(idx / 4.0)
+  let qsa_k = idx - 4.0 * qsa_w
+  let qsa_wm = qsa_w - 2.0 * floor(qsa_w / 2.0)
+  let qsa_hi = floor(qsa_w / 2.0)
+  let qsa_nb = mem_get_u8(buf, sc_off + qsa_wm * 4.0 + qsa_k)
+  let mut qsa_p = 1.0
+  let mut qsa_h = 4.0 * qsa_hi
+  while qsa_h > 0.0
+    qsa_p = qsa_p * 2.0
+    qsa_h = qsa_h - 1.0
+  end
+  let qsa_v = floor(qsa_nb / qsa_p)
+  let qsa_nib = qsa_v - 16.0 * floor(qsa_v / 16.0)
+  let mut qsa_e = 1.0
+  let mut qsa_s = 2.0 * qsa_w
+  while qsa_s > 0.0
+    qsa_e = qsa_e * 2.0
+    qsa_s = qsa_s - 1.0
+  end
+  let qsa_xb = mem_get_u8(buf, sc_off + 8.0 + qsa_k)
+  let qsa_xs = floor(qsa_xb / qsa_e)
+  let qsa_ext = qsa_xs - 4.0 * floor(qsa_xs / 4.0)
+  return qsa_nib + 16.0 * qsa_ext
+end
+
+fn dequant_q3_k_block_m(buf, block_off)
+  // 256 weights from 110 bytes: hmask[32] @0, qs[64] @32, scales[12] @96, d f16 @108. Two passes of
+  // 128 weights; the 2-bit field shift restarts each pass but the hmask bit position keeps advancing
+  // (dequantize_row_q3_K declares m outside the n loop), which is what makes one bit per weight land
+  // on the right element.
+  let q3_d = read_f16_le_m(buf, block_off + 108.0)
+  let q3_sc = block_off + 96.0
+  let mut q3_out = []
+  let mut q3_is = 0.0
+  let mut q3_n = 0.0
+  while q3_n < 2.0
+    let q3_qb = block_off + 32.0 + q3_n * 32.0
+    let mut q3_j = 0.0
+    while q3_j < 4.0
+      let mut q3_sp = 1.0
+      let mut q3_ssh = 2.0 * q3_j
+      while q3_ssh > 0.0
+        q3_sp = q3_sp * 2.0
+        q3_ssh = q3_ssh - 1.0
+      end
+      let q3_bit = q3_j + 4.0 * q3_n
+      let q3_sc1 = q3k_scale_at(buf, q3_sc, q3_is)
+      q3_is = q3_is + 1.0
+      let q3_dl1 = q3_d * (q3_sc1 - 32.0)
+      let mut q3_l = 0.0
+      while q3_l < 16.0
+        let q3_b = mem_get_u8(buf, q3_qb + q3_l)
+        let q3_s = floor(q3_b / q3_sp)
+        let q3_q = q3_s - 4.0 * floor(q3_s / 4.0)
+        let q3_h = bit_at_m(buf, block_off + q3_l, q3_bit)
+        push(q3_out, q3_dl1 * (q3_q + 4.0 * q3_h - 4.0))
+        q3_l = q3_l + 1.0
+      end
+      let q3_sc2 = q3k_scale_at(buf, q3_sc, q3_is)
+      q3_is = q3_is + 1.0
+      let q3_dl2 = q3_d * (q3_sc2 - 32.0)
+      let mut q3_l2 = 0.0
+      while q3_l2 < 16.0
+        let q3_b2 = mem_get_u8(buf, q3_qb + 16.0 + q3_l2)
+        let q3_s2 = floor(q3_b2 / q3_sp)
+        let q3_q2 = q3_s2 - 4.0 * floor(q3_s2 / 4.0)
+        let q3_h2 = bit_at_m(buf, block_off + 16.0 + q3_l2, q3_bit)
+        push(q3_out, q3_dl2 * (q3_q2 + 4.0 * q3_h2 - 4.0))
+        q3_l2 = q3_l2 + 1.0
+      end
+      q3_j = q3_j + 1.0
+    end
+    q3_n = q3_n + 1.0
+  end
+  return q3_out
+end
+
 // ── MEM-based Q8_0 / Q5_0 / BF16 dequant ────────────────────────
 // Block layouts and value formulas were confirmed element-by-element against ggml's own
 // dequantization (an F32 re-quant of the same file), not from a recalled bit layout:
@@ -865,6 +949,20 @@ fn load_tensor_from_file(file_path, model, tname)
       bg1 = bg1 + 1.0
       blkg1 = blkg1 + 34.0
     end
+  elif ttype == 11.0
+    // Q3_K: 256 weights per 110-byte block
+    let mut bq3 = 0.0
+    let mut blkbq3 = 0.0
+    while bq3 < count / 256.0
+      let vq3 = dequant_q3_k_block_m(raw, blkbq3)
+      let mut iq3 = 0.0
+      while iq3 < len(vq3)
+        push(result, vq3[int(iq3)])
+        iq3 = iq3 + 1.0
+      end
+      bq3 = bq3 + 1.0
+      blkbq3 = blkbq3 + 110.0
+    end
   elif ttype == 14.0
     // Q6_K: 256 weights per 210-byte block, count may end mid-block
     let mut b6 = 0.0
@@ -883,7 +981,7 @@ fn load_tensor_from_file(file_path, model, tname)
       b6 = b6 + 1.0
     end
   else
-    assert(false, "load_tensor_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q4_K, Q5_K, Q6_K, TQ1_0, TQ2_0 and Q2_0_g128)")
+    assert(false, "load_tensor_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, TQ1_0, TQ2_0 and Q2_0_g128)")
   end
 
   mem_free(raw)

@@ -1,4 +1,4 @@
-// Verifies the q4_0, q4_1, q5_1, q5_k, q2_k, tq1_0, tq2_0 and q2_0_g128 block decoders in stdlib/llm/weight_loader.flow
+// Verifies the q4_0, q4_1, q5_1, q5_k, q2_k, q3_k, tq1_0, tq2_0 and q2_0_g128 block decoders in stdlib/llm/weight_loader.flow
 // against ggml's own dequantization.
 //
 // Each testdata/<type>.bin is a 16-byte header (u32 block bytes, u32 values per block, u32 record
@@ -38,11 +38,20 @@
 //     from offset 0 gave 26496 and 2048 wrong values that were, once multiplied out, still small
 //     enough to look like weights.
 //
-// What is deliberately not here: Q8_1 (this build rejects "q8_1" as an ftype, so there is no ggml
-// output to compare a decoder against), Q3_K (its 12 scale bytes pack six 6-bit scales with six 2-bit
-// extensions and ggml unpacks them through 32-bit words, which needs care not to lose bits above the
-// 24th), the IQ family (code books) and TQ1_0/TQ2_0 (both writable by this build at ftypes 36/37, and
-// still to do). Q2_K is included as the K-quant that has no such repack.
+// What is deliberately not here: Q8_1, because this build's llama-quantize rejects "q8_1" as an ftype,
+// so no ggml output exists to compare a decoder against; and the IQ family, whose dequant reads ggml's
+// code books.
+//
+// Q3_K is the hardest case in this file and it is covered, which is worth calling out: ggml unpacks
+// q3_K's twelve scale bytes into sixteen 6-bit scales through 32-bit words, and that word play cannot
+// be reproduced in a language whose numbers are f32 (anything above the 24th bit would silently
+// vanish). q3k_scale_at in weight_loader.flow does the same unpacking byte-wise, and the reason it can
+// is that the two extension bits for scale (W, k) sit at positions 2W and 2W+1 of scales[8 + k] with
+// 2W <= 6, so the pair never straddles a byte boundary.
+//
+// q2_k and q3_k together also make the field-order point concrete: block_q2_K puts its two f16 halves
+// at the END of the 84 bytes, while block_q3_K ends with scales[12] then a single d at offset 108.
+// Neither matches the q4_K/q5_K habit of leading with the scales.
 //
 // Run from the octoflow root so the relative fixture paths resolve, like every other stdlib test:
 //
@@ -345,7 +354,43 @@ while ng1 < 16.0
 end
 print("  q2_0_g128: {badg1} of 2048 outside tolerance, worst abs diff {worstg1}")
 mem_free(bg1)
-let moretotal = bad40 + bad41 + bad51 + bad5k + bad2k + badtq1_0 + badtq2_0 + badg1
+// ── q3_k: 110-byte blocks of 256 weights, six-bit scales in 12 bytes ──
+let p3k = dir + "q3_k.bin"
+let sz3k = file_size(p3k)
+let b3k = mem_alloc(sz3k)
+let _rd3k = file_read_into_mem(p3k, b3k, 0.0, sz3k)
+let mut bad3k = 0.0
+let mut worst3k = 0.0
+let mut n3k = 0.0
+let mut o3k = 16.0
+while n3k < 8.0
+  let v3k = dequant_q3_k_block_m(b3k, o3k)
+  let mut k3k = 0.0
+  while k3k < 256.0
+    let r3k = mem_get_f32(b3k, o3k + 110.0 + k3k * 4.0)
+    let g3k = v3k[int(k3k)]
+    let mut e3k = g3k - r3k
+    if e3k < 0.0
+      e3k = e3k * -1.0
+    end
+    let mut a3k = r3k
+    if a3k < 0.0
+      a3k = a3k * -1.0
+    end
+    if e3k > worst3k
+      worst3k = e3k
+    end
+    if e3k > a3k * 0.001 + 0.000000001
+      bad3k = bad3k + 1.0
+    end
+    k3k = k3k + 1.0
+  end
+  o3k = o3k + 1134.0
+  n3k = n3k + 1.0
+end
+print("  q3_k: {bad3k} of 2048 outside tolerance, worst abs diff {worst3k}")
+mem_free(b3k)
+let moretotal = bad40 + bad41 + bad51 + bad5k + bad2k + bad3k + badtq1_0 + badtq2_0 + badg1
 if moretotal == 0.0
   print("DEQUANT DECODERS MATCH THE GGML ORACLE")
 end
