@@ -1,4 +1,4 @@
-// Verifies the q4_0, q4_1, q5_1, q5_k, q2_k, q3_k, tq1_0, tq2_0 and q2_0_g128 block decoders in stdlib/llm/weight_loader.flow
+// Verifies the q4_0, q4_1, q5_1, q5_k, q2_k, q3_k, iq4_nl, tq1_0, tq2_0 and q2_0_g128 decoders in stdlib/llm/weight_loader.flow
 // against ggml's own dequantization.
 //
 // Each testdata/<type>.bin is a 16-byte header (u32 block bytes, u32 values per block, u32 record
@@ -40,7 +40,7 @@
 //
 // What is deliberately not here: Q8_1, because this build's llama-quantize rejects "q8_1" as an ftype,
 // so no ggml output exists to compare a decoder against; and the IQ family, whose dequant reads ggml's
-// code books.
+// code books, so iq4_nl is the only IQ type here -- its table is 16 values.
 //
 // Q3_K is the hardest case in this file and it is covered, which is worth calling out: ggml unpacks
 // q3_K's twelve scale bytes into sixteen 6-bit scales through 32-bit words, and that word play cannot
@@ -390,7 +390,43 @@ while n3k < 8.0
 end
 print("  q3_k: {bad3k} of 2048 outside tolerance, worst abs diff {worst3k}")
 mem_free(b3k)
-let moretotal = bad40 + bad41 + bad51 + bad5k + bad2k + bad3k + badtq1_0 + badtq2_0 + badg1
+// ── iq4_nl: 18-byte blocks of 32 weights, nonlinear nibble table ──
+let p4n = dir + "iq4_nl.bin"
+let sz4n = file_size(p4n)
+let b4n = mem_alloc(sz4n)
+let _rd4n = file_read_into_mem(p4n, b4n, 0.0, sz4n)
+let mut bad4n = 0.0
+let mut worst4n = 0.0
+let mut n4n = 0.0
+let mut o4n = 16.0
+while n4n < 64.0
+  let v4n = dequant_iq4_nl_block_m(b4n, o4n)
+  let mut k4n = 0.0
+  while k4n < 32.0
+    let r4n = mem_get_f32(b4n, o4n + 18.0 + k4n * 4.0)
+    let g4n = v4n[int(k4n)]
+    let mut e4n = g4n - r4n
+    if e4n < 0.0
+      e4n = e4n * -1.0
+    end
+    let mut a4n = r4n
+    if a4n < 0.0
+      a4n = a4n * -1.0
+    end
+    if e4n > worst4n
+      worst4n = e4n
+    end
+    if e4n > a4n * 0.001 + 0.000000001
+      bad4n = bad4n + 1.0
+    end
+    k4n = k4n + 1.0
+  end
+  o4n = o4n + 146.0
+  n4n = n4n + 1.0
+end
+print("  iq4_nl: {bad4n} of 2048 outside tolerance, worst abs diff {worst4n}")
+mem_free(b4n)
+let moretotal = bad40 + bad41 + bad51 + bad5k + bad2k + bad3k + badtq1_0 + badtq2_0 + bad4n + badg1
 if moretotal == 0.0
   print("DEQUANT DECODERS MATCH THE GGML ORACLE")
 end

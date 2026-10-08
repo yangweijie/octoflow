@@ -13,7 +13,7 @@
 // Uses FLAT key API from gguf.flow — no nested maps.
 // Tensor info stored as: t.NAME.type, t.NAME.offset, t.NAME.count, etc.
 //
-// Decodes: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
+// Decodes: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL,
 // TQ1_0, TQ2_0 and Q2_0_g128 (PQ2_0). Every block layout was checked
 // element-by-element against ggml's own dequantization: stdlib/llm/test_dequant.flow for Q5_0,
 // Q8_0 and Q6_K, stdlib/llm/test_dequant_more.flow for Q4_0, Q4_1, Q5_1 and Q5_K.
@@ -563,6 +563,69 @@ fn dequant_q3_k_block_m(buf, block_off)
   return q3_out
 end
 
+// ── MEM-based IQ4_NL dequant ─────────────────────────────────────
+// ggml's kvalues_iq4nl (ggml-common.h:1133), quoted exactly:
+//   { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 }
+fn iq4nl_val(k)
+  if k == 0.0
+    return -127.0
+  elif k == 1.0
+    return -104.0
+  elif k == 2.0
+    return -83.0
+  elif k == 3.0
+    return -65.0
+  elif k == 4.0
+    return -49.0
+  elif k == 5.0
+    return -35.0
+  elif k == 6.0
+    return -22.0
+  elif k == 7.0
+    return -10.0
+  elif k == 8.0
+    return 1.0
+  elif k == 9.0
+    return 13.0
+  elif k == 10.0
+    return 25.0
+  elif k == 11.0
+    return 38.0
+  elif k == 12.0
+    return 53.0
+  elif k == 13.0
+    return 69.0
+  elif k == 14.0
+    return 89.0
+  elif k == 15.0
+    return 113.0
+  end
+  assert(false, "iq4nl_val: nibble out of range " + str(k))
+  return 0.0
+end
+
+fn dequant_iq4_nl_block_m(buf, block_off)
+  // 32 weights from 18 bytes: d f16 @0, qs[16] @2. Same split-nibble order as q4_0 -- byte j
+  // holds weight j in its low nibble and weight j + 16 in its high nibble -- but the value is
+  // d * kvalues_iq4nl[nibble], a nonlinear 16-entry code book, which is why this is a separate
+  // type and not just Q4_0 with a different scale.
+  let i4_d = read_f16_le_m(buf, block_off)
+  let mut i4_out = []
+  let mut i4_j = 0.0
+  while i4_j < 16.0
+    let i4_b = mem_get_u8(buf, block_off + 2.0 + i4_j)
+    push(i4_out, i4_d * iq4nl_val(i4_b - floor(i4_b / 16.0) * 16.0))
+    i4_j = i4_j + 1.0
+  end
+  let mut i4_k = 0.0
+  while i4_k < 16.0
+    let i4_b2 = mem_get_u8(buf, block_off + 2.0 + i4_k)
+    push(i4_out, i4_d * iq4nl_val(floor(i4_b2 / 16.0)))
+    i4_k = i4_k + 1.0
+  end
+  return i4_out
+end
+
 // ── MEM-based Q8_0 / Q5_0 / BF16 dequant ────────────────────────
 // Block layouts and value formulas were confirmed element-by-element against ggml's own
 // dequantization (an F32 re-quant of the same file), not from a recalled bit layout:
@@ -964,6 +1027,20 @@ fn load_tensor_from_file(file_path, model, tname)
       bq3 = bq3 + 1.0
       blkbq3 = blkbq3 + 110.0
     end
+  elif ttype == 20.0
+    // IQ4_NL: 32 weights per 18-byte block, nonlinear nibble table
+    let mut bi4 = 0.0
+    let mut blki4 = 0.0
+    while bi4 < count / 32.0
+      let vi4 = dequant_iq4_nl_block_m(raw, blki4)
+      let mut ii4 = 0.0
+      while ii4 < len(vi4)
+        push(result, vi4[int(ii4)])
+        ii4 = ii4 + 1.0
+      end
+      bi4 = bi4 + 1.0
+      blki4 = blki4 + 18.0
+    end
   elif ttype == 14.0
     // Q6_K: 256 weights per 210-byte block, count may end mid-block
     let mut b6 = 0.0
@@ -982,7 +1059,7 @@ fn load_tensor_from_file(file_path, model, tname)
       b6 = b6 + 1.0
     end
   else
-    assert(false, "load_tensor_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, TQ1_0, TQ2_0 and Q2_0_g128)")
+    assert(false, "load_tensor_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, TQ1_0, TQ2_0 and Q2_0_g128)")
   end
 
   mem_free(raw)
