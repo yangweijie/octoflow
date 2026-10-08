@@ -13,7 +13,7 @@
 // Uses FLAT key API from gguf.flow — no nested maps.
 // Tensor info stored as: t.NAME.type, t.NAME.offset, t.NAME.count, etc.
 //
-// Decodes: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K. Every block
+// Decodes: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q4_K, Q5_K, Q6_K. Every block
 // layout was checked
 // element-by-element against ggml's own dequantization: stdlib/llm/test_dequant.flow for Q5_0,
 // Q8_0 and Q6_K, stdlib/llm/test_dequant_more.flow for Q4_0, Q4_1, Q5_1 and Q5_K.
@@ -315,6 +315,49 @@ fn dequant_q5_k_block_m(buf, block_off)
     q5k_g = q5k_g + 1.0
   end
   return q5k_out
+end
+
+fn dequant_q2_k_block_m(buf, block_off)
+  // 256 weights from 84 bytes, as dequantize_row_q2_K does: scales[16] @0, qs[64] @16,
+  // d f16 @80, dmin f16 @82. Sixteen sub-blocks of 16 weights, two per scale byte:
+  // dl = d * (s & 0xF) and ml = dmin * (s >> 4). Two passes of 128 weights, each consuming four
+  // scale bytes and shifting by 0, 2, 4, 6 into the same 2-bit fields.
+  // Field order is scales, quants, then the two halves -- NOT scale-first like q4_K/q5_K.
+  let q2k_d = read_f16_le_m(buf, block_off + 80.0)
+  let q2k_min = read_f16_le_m(buf, block_off + 82.0)
+  let mut q2k_out = []
+  let mut q2k_n = 0.0
+  while q2k_n < 2.0
+    let q2k_q = block_off + 16.0 + q2k_n * 32.0
+    let mut q2k_j = 0.0
+    while q2k_j < 4.0
+      let mut q2k_p = 1.0
+      let mut q2k_psh = 2.0 * q2k_j
+      while q2k_psh > 0.0
+        q2k_p = q2k_p * 2.0
+        q2k_psh = q2k_psh - 1.0
+      end
+      let mut q2k_k = 0.0
+      while q2k_k < 2.0
+        let q2k_sc = mem_get_u8(buf, block_off + q2k_n * 8.0 + q2k_j * 2.0 + q2k_k)
+        let q2k_dl = q2k_d * (q2k_sc - floor(q2k_sc / 16.0) * 16.0)
+        let q2k_ml = q2k_min * floor(q2k_sc / 16.0)
+        let q2k_boff = q2k_q + q2k_k * 16.0
+        let mut q2k_l = 0.0
+        while q2k_l < 16.0
+          let q2k_b = mem_get_u8(buf, q2k_boff + q2k_l)
+          let q2k_sh = floor(q2k_b / q2k_p)
+          let q2k_v = q2k_sh - 4.0 * floor(q2k_sh / 4.0)
+          push(q2k_out, q2k_dl * q2k_v - q2k_ml)
+          q2k_l = q2k_l + 1.0
+        end
+        q2k_k = q2k_k + 1.0
+      end
+      q2k_j = q2k_j + 1.0
+    end
+    q2k_n = q2k_n + 1.0
+  end
+  return q2k_out
 end
 
 // ── MEM-based Q8_0 / Q5_0 / BF16 dequant ────────────────────────
@@ -648,6 +691,20 @@ fn load_tensor_from_file(file_path, model, tname)
       bq5kb = bq5kb + 1.0
       blkq5kb = blkq5kb + 176.0
     end
+  elif ttype == 10.0
+    // Q2_K: 256 weights from 84-byte blocks
+    let mut bq2k = 0.0
+    let mut blkq2k = 0.0
+    while bq2k < count / 256.0
+      let vq2k = dequant_q2_k_block_m(raw, blkq2k)
+      let mut iq2k = 0.0
+      while iq2k < len(vq2k)
+        push(result, vq2k[int(iq2k)])
+        iq2k = iq2k + 1.0
+      end
+      bq2k = bq2k + 1.0
+      blkq2k = blkq2k + 84.0
+    end
   elif ttype == 14.0
     // Q6_K: 256 weights per 210-byte block, count may end mid-block
     let mut b6 = 0.0
@@ -666,7 +723,7 @@ fn load_tensor_from_file(file_path, model, tname)
       b6 = b6 + 1.0
     end
   else
-    assert(false, "load_tensor_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K and Q6_K)")
+    assert(false, "load_tensor_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q4_K, Q5_K and Q6_K)")
   end
 
   mem_free(raw)

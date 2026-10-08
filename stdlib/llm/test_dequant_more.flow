@@ -1,5 +1,5 @@
-// Verifies the q4_0, q4_1, q5_1 and q5_k block decoders in stdlib/llm/weight_loader.flow against
-// ggml's own dequantization.
+// Verifies the q4_0, q4_1, q5_1, q5_k and q2_k block decoders in stdlib/llm/weight_loader.flow
+// against ggml's own dequantization.
 //
 // Each testdata/<type>.bin is a 16-byte header (u32 block bytes, u32 values per block, u32 record
 // count) followed by records of [raw quantized block || the values ggml produced for it]. The
@@ -20,10 +20,29 @@
 // first version of these three decoders matched 13% of values), which is why they are checked
 // against ggml rather than against a reading of the layout.
 //
-// q5_k records come from blk.0.ffn_down.weight, not attn_q: llama-quantize --pure q5_k in this build
-// writes attn_q as q5_1 and leaves only 24 tensors as q5_K, so the q5_K bytes have to be taken from
-// one of those. Q8_1 is absent on purpose: this build rejects "q8_1" as an ftype, so there is no
-// ggml reference to compare against and the decoder is not implemented either.
+// q5_k and q2_k records come from blk.0.ffn_down.weight, not attn_q: llama-quantize --pure q5_k (and
+// q2_k) write attn_q as q5_1/q4_0 and leave the K-quant only in the ffn tensors, so the K-quant bytes
+// have to be taken from a tensor that really holds them.
+//
+// q2_k's fixture came from a different oracle path, which is worth knowing because it needs no second
+// file: a small tool that calls ggml_get_type_traits(type)->to_float on the block range. That tool was
+// checked on q8_0 against an independent hand reproduction of ggml's q8_0 formula and agreed bit for
+// bit, so its output is ggml and not my reading of ggml.
+//
+// Two offset traps, both of which a fixture here nearly fell into:
+//   - A resolved u64 tensor offset printed through a .flow number is ROUNDED, because numbers here are
+//     f32 and lose integers above 2^24: 83567424 came out as 83567420, four bytes into the previous
+//     block, which made ggml report a q2_K super-block scale of -121. Pass offsets as MEM handles.
+//   - Field order is not uniform across formats. block_q2_K is scales[16], qs[64], d, dmin -- the two
+//     halves sit at the END of the 84-byte block, unlike q4_K/q5_K which lead with them. Reading d
+//     from offset 0 gave 26496 and 2048 wrong values that were, once multiplied out, still small
+//     enough to look like weights.
+//
+// What is deliberately not here: Q8_1 (this build rejects "q8_1" as an ftype, so there is no ggml
+// output to compare a decoder against), Q3_K (its 12 scale bytes pack six 6-bit scales with six 2-bit
+// extensions and ggml unpacks them through 32-bit words, which needs care not to lose bits above the
+// 24th), the IQ family (code books) and TQ1_0/TQ2_0 (both writable by this build at ftypes 36/37, and
+// still to do). Q2_K is included as the K-quant that has no such repack.
 //
 // Run from the octoflow root so the relative fixture paths resolve, like every other stdlib test:
 //
@@ -181,7 +200,44 @@ while n5k < 8.0
 end
 print("  q5_k: {bad5k} of 2048 outside tolerance, worst abs diff {worst5k}")
 
-let moretotal = bad40 + bad41 + bad51 + bad5k
+// ── q2_k: 84-byte blocks of 256 weights, 16 sub-blocks of 16 ──
+let p2k = dir + "q2_k.bin"
+let sz2k = file_size(p2k)
+let b2k = mem_alloc(sz2k)
+let _rd2k = file_read_into_mem(p2k, b2k, 0.0, sz2k)
+let mut bad2k = 0.0
+let mut worst2k = 0.0
+let mut n2k = 0.0
+let mut o2k = 16.0
+while n2k < 8.0
+  let v2k = dequant_q2_k_block_m(b2k, o2k)
+  let mut k2k = 0.0
+  while k2k < 256.0
+    let r2k = mem_get_f32(b2k, o2k + 84.0 + k2k * 4.0)
+    let g2k = v2k[int(k2k)]
+    let mut e2k = g2k - r2k
+    if e2k < 0.0
+      e2k = e2k * -1.0
+    end
+    let mut a2k = r2k
+    if a2k < 0.0
+      a2k = a2k * -1.0
+    end
+    if e2k > worst2k
+      worst2k = e2k
+    end
+    if e2k > a2k * 0.001 + 0.000000001
+      bad2k = bad2k + 1.0
+    end
+    k2k = k2k + 1.0
+  end
+  o2k = o2k + 1108.0
+  n2k = n2k + 1.0
+end
+print("  q2_k: {bad2k} of 2048 outside tolerance, worst abs diff {worst2k}")
+
+mem_free(b2k)
+let moretotal = bad40 + bad41 + bad51 + bad5k + bad2k
 if moretotal == 0.0
   print("DEQUANT DECODERS MATCH THE GGML ORACLE")
 end
