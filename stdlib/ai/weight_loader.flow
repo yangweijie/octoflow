@@ -14,11 +14,15 @@
 // Tensor info stored as: t.NAME.type, t.NAME.offset, t.NAME.count, etc.
 //
 // Decodes: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL,
-// TQ1_0, TQ2_0 and Q2_0_g128 (PQ2_0). Every block layout was checked
-// element-by-element against ggml's own dequantization: stdlib/llm/test_dequant.flow for Q5_0,
-// Q8_0 and Q6_K, stdlib/llm/test_dequant_more.flow for Q4_0, Q4_1, Q5_1 and Q5_K.
+// IQ4_XS, MXFP4, NVFP4, Q1_0, Q2_0, TQ1_0, TQ2_0 and Q2_0_g128 (PQ2_0). Every block layout was
+// checked element-by-element against ggml's own dequantization: stdlib/llm/test_dequant.flow for
+// Q5_0, Q8_0 and Q6_K; stdlib/llm/test_dequant_more.flow for ten more, from block bytes taken out
+// of files llama-quantize wrote; and stdlib/llm/test_row_range.flow for fifteen of them through both
+// readers (three element windows and one whole-tensor load each), which is also the only check on
+// IQ4_XS, MXFP4, NVFP4, Q1_0 and Q2_0 because llama-quantize has no ftype name for the first three
+// and no shipped checkpoint carries the last two.
 // Rows and slices go through load_element_range_from_file, which covers the same type list.
-// type rather than returning zeros — for a whole tensor use the gguf_load_tensor() Rust builtin.
+// A type with geometry but no decoder is an assert, not a silent zero: see the two dispatch chains.
 //
 // Functions (first argument is always the GGUF file path):
 //   load_tensor_from_file(file_path, model, tname) → float array, whole tensor
@@ -626,6 +630,198 @@ fn dequant_iq4_nl_block_m(buf, block_off)
   return i4_out
 end
 
+// ── e2m1 (MXFP4 / NVFP4) and the remaining block types ──────────
+
+// kvalues_fp4: the OCP MX E2M1 set, doubled so the shared scale helper can hand the factor of two
+// back. ggml-impl.h:477 returns 2^(e-128) where the e8m0 exponent alone would say 2^(e-127), and the
+// comment there is explicit that this exists because "the E0M2 values are doubled". Index 8 is -0.0,
+// which is why a code book of sixteen e2m1 codes only produces fifteen distinct magnitudes.
+fn fp4_val(k)
+  if k == 0.0
+    return 0.0
+  elif k == 1.0
+    return 1.0
+  elif k == 2.0
+    return 2.0
+  elif k == 3.0
+    return 3.0
+  elif k == 4.0
+    return 4.0
+  elif k == 5.0
+    return 6.0
+  elif k == 6.0
+    return 8.0
+  elif k == 7.0
+    return 12.0
+  elif k == 8.0
+    return 0.0
+  elif k == 9.0
+    return -1.0
+  elif k == 10.0
+    return -2.0
+  elif k == 11.0
+    return -3.0
+  elif k == 12.0
+    return -4.0
+  elif k == 13.0
+    return -6.0
+  elif k == 14.0
+    return -8.0
+  end
+  return -12.0
+end
+
+// UE4M3 sub-block scale, halved for the same reason. 0x7F is the all-ones pattern ggml maps to 0
+// rather than NaN. The exponent field is four bits, so it has to be masked off bit 7 of the byte.
+fn fp4_ue4m3(x)
+  if x == 0.0
+    return 0.0
+  end
+  if x == 127.0
+    return 0.0
+  end
+  let u4_exp = floor(x / 8.0) - 16.0 * floor(x / 128.0)
+  let u4_man = x - 8.0 * floor(x / 8.0)
+  if u4_exp == 0.0
+    return u4_man * 0.001953125 * 0.5
+  end
+  return (1.0 + u4_man / 8.0) * pow(2.0, u4_exp - 7.0) * 0.5
+end
+
+fn dequant_mxfp4_block_m(buf, block_off)
+  // 32 weights from 17 bytes: e u8 (E8M0) @0, qs[16] @1. Split-nibble order again -- byte j is
+  // weight j in the low nibble and weight j+16 in the high one.
+  let m4_e = mem_get_u8(buf, block_off)
+  let m4_d = pow(2.0, m4_e - 128.0)
+  let mut m4_out = []
+  let mut m4_j = 0.0
+  while m4_j < 16.0
+    let m4_b = mem_get_u8(buf, block_off + 1.0 + m4_j)
+    push(m4_out, m4_d * fp4_val(m4_b - floor(m4_b / 16.0) * 16.0))
+    m4_j = m4_j + 1.0
+  end
+  let mut m4_k = 0.0
+  while m4_k < 16.0
+    let m4_b2 = mem_get_u8(buf, block_off + 1.0 + m4_k)
+    push(m4_out, m4_d * fp4_val(floor(m4_b2 / 16.0)))
+    m4_k = m4_k + 1.0
+  end
+  return m4_out
+end
+
+fn dequant_nvfp4_block_m(buf, block_off)
+  // 64 weights from 36 bytes: four UE4M3 scales @0..3, one per 16-element sub-block, then qs[32] @4.
+  // The sub-block is 16 wide, so a byte carries weight j and weight j+8 of the *same* sub-block --
+  // unlike MXFP4/IQ4_NL where the high nibble lands half a block (16) away.
+  let mut n4_out = []
+  let mut n4_s = 0.0
+  while n4_s < 4.0
+    let n4_d = fp4_ue4m3(mem_get_u8(buf, block_off + n4_s))
+    let mut n4_j = 0.0
+    while n4_j < 8.0
+      let n4_b = mem_get_u8(buf, block_off + 4.0 + n4_s * 8.0 + n4_j)
+      push(n4_out, n4_d * fp4_val(n4_b - floor(n4_b / 16.0) * 16.0))
+      n4_j = n4_j + 1.0
+    end
+    let mut n4_k = 0.0
+    while n4_k < 8.0
+      let n4_b2 = mem_get_u8(buf, block_off + 4.0 + n4_s * 8.0 + n4_k)
+      push(n4_out, n4_d * fp4_val(floor(n4_b2 / 16.0)))
+      n4_k = n4_k + 1.0
+    end
+    n4_s = n4_s + 1.0
+  end
+  return n4_out
+end
+
+fn dequant_q1_0_block_m(buf, block_off)
+  // 128 weights from 18 bytes: d f16 @0..1, qs[16] @2, one bit per weight, LSB first. The bit picks
+  // between +d and -d; there is no zero and no offset, so (2*bit - 1) * d is the whole codec.
+  let q1_d = read_f16_le_m(buf, block_off)
+  let mut q1_out = []
+  let mut q1_w = 0.0
+  while q1_w < 16.0
+    let mut q1_k = 0.0
+    while q1_k < 8.0
+      let q1_b = bit_at_m(buf, block_off + 2.0 + q1_w, q1_k)
+      push(q1_out, q1_d * (2.0 * q1_b - 1.0))
+      q1_k = q1_k + 1.0
+    end
+    q1_w = q1_w + 1.0
+  end
+  return q1_out
+end
+
+fn dequant_q2_0_block_m(buf, block_off)
+  // 64 weights from 18 bytes: d f16 @0..1, qs[16] @2, two bits per weight, code q is (q - 1) * d. Same
+  // codec as Q2_0_g128 (type 142) at group 64, so type 42 and type 142 differ only in how many
+  // weights share one scale.
+  let g2_d = read_f16_le_m(buf, block_off)
+  let mut g2_out = []
+  let mut g2_w = 0.0
+  while g2_w < 16.0
+    let g2_b = mem_get_u8(buf, block_off + 2.0 + g2_w)
+    let mut g2_k = 0.0
+    while g2_k < 4.0
+      let mut g2_p = 1.0
+      let mut g2_sh = 2.0 * g2_k
+      while g2_sh > 0.0
+        g2_p = g2_p * 2.0
+        g2_sh = g2_sh - 1.0
+      end
+      let g2_s = floor(g2_b / g2_p)
+      push(g2_out, (g2_s - 4.0 * floor(g2_s / 4.0) - 1.0) * g2_d)
+      g2_k = g2_k + 1.0
+    end
+    g2_w = g2_w + 1.0
+  end
+  return g2_out
+end
+
+fn dequant_iq4_xs_block_m(buf, block_off)
+  // 256 weights from 136 bytes: d f16 @0, scales_h u16 @2, scales_l[4] @4, qs[128] @8. Eight
+  // sub-blocks of 32, each with a 6-bit scale made of 4 bits from scales_l and 2 bits from
+  // scales_h, applied as d * (scale - 32) to IQ4_NL's nibble table. So this is IQ4_NL with
+  // per-32-block scales rather than a per-block one, and the scale is split across two fields,
+  // which is why the low 4 bits must be joined to the high 2 rather than read from one place.
+  let ix_d = read_f16_le_m(buf, block_off)
+  let ix_h = mem_get_u8(buf, block_off + 2.0) + mem_get_u8(buf, block_off + 3.0) * 256.0
+  let mut ix_out = []
+  let mut ix_ib = 0.0
+  while ix_ib < 8.0
+    let mut ix_p = 1.0
+    let mut ix_c = 4.0 * (ix_ib - 2.0 * floor(ix_ib / 2.0))
+    while ix_c > 0.0
+      ix_p = ix_p * 2.0
+      ix_c = ix_c - 1.0
+    end
+    let ix_l = mem_get_u8(buf, block_off + 4.0 + floor(ix_ib / 2.0))
+    let ix_s4 = floor(ix_l / ix_p) - 16.0 * floor(ix_l / (ix_p * 16.0))
+    let mut ix_qp = 1.0
+    let mut ix_qc = 2.0 * ix_ib
+    while ix_qc > 0.0
+      ix_qp = ix_qp * 2.0
+      ix_qc = ix_qc - 1.0
+    end
+    let ix_h2 = floor(ix_h / ix_qp) - 4.0 * floor(ix_h / (ix_qp * 4.0))
+    let ix_dl = ix_d * (ix_s4 + ix_h2 * 16.0 - 32.0)
+    let mut ix_j = 0.0
+    while ix_j < 16.0
+      let ix_b = mem_get_u8(buf, block_off + 8.0 + ix_ib * 16.0 + ix_j)
+      push(ix_out, ix_dl * iq4nl_val(ix_b - floor(ix_b / 16.0) * 16.0))
+      ix_j = ix_j + 1.0
+    end
+    let mut ix_k = 0.0
+    while ix_k < 16.0
+      let ix_b2 = mem_get_u8(buf, block_off + 8.0 + ix_ib * 16.0 + ix_k)
+      push(ix_out, ix_dl * iq4nl_val(floor(ix_b2 / 16.0)))
+      ix_k = ix_k + 1.0
+    end
+    ix_ib = ix_ib + 1.0
+  end
+  return ix_out
+end
+
 // ── MEM-based Q8_0 / Q5_0 / BF16 dequant ────────────────────────
 // Block layouts and value formulas were confirmed element-by-element against ggml's own
 // dequantization (an F32 re-quant of the same file), not from a recalled bit layout:
@@ -1041,6 +1237,76 @@ fn load_tensor_from_file(file_path, model, tname)
       bi4 = bi4 + 1.0
       blki4 = blki4 + 18.0
     end
+  elif ttype == 23.0
+    // IQ4_XS: 256 weights per 136-byte block, IQ4_NL code book with per-32 scales
+    let mut b4x = 0.0
+    let mut blk4x = 0.0
+    while b4x < count / 256.0
+      let v4x = dequant_iq4_xs_block_m(raw, blk4x)
+      let mut i4x = 0.0
+      while i4x < len(v4x)
+        push(result, v4x[int(i4x)])
+        i4x = i4x + 1.0
+      end
+      b4x = b4x + 1.0
+      blk4x = blk4x + 136.0
+    end
+  elif ttype == 39.0
+    // MXFP4: 32 weights per 17-byte block, e8m0 scale and e2m1 nibbles
+    let mut bmx = 0.0
+    let mut blkmx = 0.0
+    while bmx < count / 32.0
+      let vmx = dequant_mxfp4_block_m(raw, blkmx)
+      let mut imx = 0.0
+      while imx < len(vmx)
+        push(result, vmx[int(imx)])
+        imx = imx + 1.0
+      end
+      bmx = bmx + 1.0
+      blkmx = blkmx + 17.0
+    end
+  elif ttype == 40.0
+    // NVFP4: 64 weights per 36-byte block, four ue4m3 sub-block scales
+    let mut bnv = 0.0
+    let mut blknv = 0.0
+    while bnv < count / 64.0
+      let vnv = dequant_nvfp4_block_m(raw, blknv)
+      let mut inv = 0.0
+      while inv < len(vnv)
+        push(result, vnv[int(inv)])
+        inv = inv + 1.0
+      end
+      bnv = bnv + 1.0
+      blknv = blknv + 36.0
+    end
+  elif ttype == 41.0
+    // Q1_0: 128 weights per 18-byte block, one bit each
+    let mut bq1 = 0.0
+    let mut blkq1 = 0.0
+    while bq1 < count / 128.0
+      let vq1t = dequant_q1_0_block_m(raw, blkq1)
+      let mut iq1t = 0.0
+      while iq1t < len(vq1t)
+        push(result, vq1t[int(iq1t)])
+        iq1t = iq1t + 1.0
+      end
+      bq1 = bq1 + 1.0
+      blkq1 = blkq1 + 18.0
+    end
+  elif ttype == 42.0
+    // Q2_0: 64 weights per 18-byte block, two bits each
+    let mut bq2 = 0.0
+    let mut blkq2 = 0.0
+    while bq2 < count / 64.0
+      let vq2t = dequant_q2_0_block_m(raw, blkq2)
+      let mut iq2t = 0.0
+      while iq2t < len(vq2t)
+        push(result, vq2t[int(iq2t)])
+        iq2t = iq2t + 1.0
+      end
+      bq2 = bq2 + 1.0
+      blkq2 = blkq2 + 18.0
+    end
   elif ttype == 14.0
     // Q6_K: 256 weights per 210-byte block, count may end mid-block
     let mut b6 = 0.0
@@ -1059,7 +1325,7 @@ fn load_tensor_from_file(file_path, model, tname)
       b6 = b6 + 1.0
     end
   else
-    assert(false, "load_tensor_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, TQ1_0, TQ2_0 and Q2_0_g128)")
+    assert(false, "load_tensor_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, MXFP4, NVFP4, Q1_0, Q2_0, TQ1_0, TQ2_0 and Q2_0_g128)")
   end
 
   mem_free(raw)
@@ -1184,6 +1450,21 @@ fn load_element_range_from_file(file_path, off_buf, elem_start, elem_count, ttyp
       lge_hit = 1.0
     elif ttype == 142.0
       lge_vb = dequant_q2_0_g128_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 23.0
+      lge_vb = dequant_iq4_xs_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 39.0
+      lge_vb = dequant_mxfp4_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 40.0
+      lge_vb = dequant_nvfp4_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 41.0
+      lge_vb = dequant_q1_0_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 42.0
+      lge_vb = dequant_q2_0_block_m(lge_raw, lge_bo)
       lge_hit = 1.0
     end
     if lge_hit == 0.0
