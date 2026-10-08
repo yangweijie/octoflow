@@ -144,16 +144,13 @@ let im_end = 151645.0
 let nl_id = 198.0
 
 print("=== OctoFlow Text Generation (KV Cache + BPE) ===")
-print("Loading model into memory...")
+print("Loading model metadata...")
 
-// Cache entire GGUF file in memory — eliminates per-tensor disk I/O
-let t_cache_0 = time()
-let cached_size = gguf_cache_file(model_path)
-let t_cache_1 = time()
-let cache_ms = (t_cache_1 - t_cache_0) * 1000.0
-let cache_mb = cached_size / 1048576.0
-print("  Cached {cache_mb} MB in {cache_ms} ms")
-
+// No whole-file cache here: gguf_load_tensor, gguf_matvec and gguf_infer_layer all take the path
+// and keep their own per-tensor cache, so caching the checkpoint as well only added a second full
+// copy of it. Measured on the all-F32 Qwen2.5-0.5B control (14 prompt + 17 generated tokens,
+// sampling the working set every 0.4 s): peak RSS 7.86 GB -> 6.01 GB and wall 47.4 s -> 43.2 s,
+// with byte-identical output. stdlib/llm/generate.flow never made this call.
 let model = gguf_load_from_file(model_path)
 
 let n_embd = map_get(model, "n_embd")
