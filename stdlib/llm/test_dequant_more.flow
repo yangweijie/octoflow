@@ -41,14 +41,15 @@
 // What is deliberately not here: Q8_1, and now the reason is known rather than guessed -- ggml has no
 // to_float for it at all (ggml.c's type_traits table leaves the field null for GGML_TYPE_Q8_1, and the
 // quantize_chunk switch has no case for it either), so there is no ggml decode to agree with; it is an
-// intermediate the repack code writes and never a stored weight format. Also not here: the rest of the
-// IQ family, whose decoders read ggml's code books (iq2xxs_grid 256x8 bytes, iq2xs_grid 512, iq2s_grid
-// 1024, iq3xxs_grid 256x4, iq3s_grid 512, iq1s_grid 2048). iq4_nl is the IQ type that needs no book,
-// and iq4_xs is the second, because it reuses iq4_nl's 16 values; both are covered.
+// intermediate the repack code writes and never a stored weight format. Same for Q8_K, I8/I16/I32/I64
+// and F64: null to_float, nothing to compare against.
 //
-// Since this file was written, ggml_quantize_chunk has become the fixture source for the types
-// llama-quantize will not name: see stdlib/llm/test_row_range.flow, which covers iq4_xs, mxfp4, nvfp4,
-// q1_0 and q2_0 against ggml's own quantizer-and-decoder pair.
+// Since this file was written, two things changed. ggml_quantize_chunk became the fixture source for
+// the types llama-quantize will not write -- no ftype name (mxfp4, nvfp4), or an imatrix it was not
+// handed (iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq2_s, iq1_m) -- and the seven IQ types that read a code
+// book landed on top of iq4_nl and iq4_xs -- see stdlib/llm/test_row_range.flow, which now covers
+// iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq1_m, iq4_xs, mxfp4, nvfp4, q1_0 and q2_0 as well as
+// the ten types here, each against ggml's own quantizer-and-decoder pair.
 //
 // Q3_K is the hardest case in this file and it is covered, which is worth calling out: ggml unpacks
 // q3_K's twelve scale bytes into sixteen 6-bit scales through 32-bit words, and that word play cannot

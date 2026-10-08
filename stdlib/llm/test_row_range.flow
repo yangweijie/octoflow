@@ -22,14 +22,16 @@
 // The fixtures split by provenance, and it is worth knowing which is which:
 //   q4_0 q4_1 q5_1 q5_k q2_k q3_k iq4_nl tq1_0 tq2_0 q2_0_g128
 //     block bytes lifted out of a GGUF that llama-quantize wrote from a real all-F32 checkpoint.
-//   iq4_xs mxfp4 nvfp4 q1_0 q2_0
+//   iq4_xs mxfp4 nvfp4 q1_0 q2_0 iq2_xxs iq2_xs iq3_xxs iq1_s iq3_s iq2_s iq1_m
 //     ggml's own quantizer applied to a deterministic pseudo-random input (ggml_quantize_chunk, via
-//     ggml_dequant_dump --synth). llama-quantize has no ftype name for iq4_xs/mxfp4/nvfp4, so no
-//     quantized file on disk carries them, but ggml_quantize_chunk does switch on all of them. The
-//     property under test is unaffected: ggml wrote the block and ggml read it back, and this file
-//     checks that the .flow decoder reads it back the same way. Synthetic input is also the only way
-//     to see a code a trained model never emits -- q2_0's 11 (= +2*d) and the whole 6-bit scale
-//     range of iq4_xs appear here and do not appear in a real checkpoint.
+//     ggml_dequant_dump --synth). That is the only route covering all of them: llama-quantize has no
+//     ftype name for mxfp4 and nvfp4, six of the code-book types (iq2_xxs, iq2_xs, iq3_xxs, iq1_s,
+//     iq2_s, iq1_m) refuse to quantize without an importance matrix file, and the remaining ones would
+//     each need a full requant of a real checkpoint. ggml_quantize_chunk switches on every one of them
+//     and accepts a synthetic imatrix. The property under test is unaffected: ggml wrote the block and
+//     ggml read it back, and this file checks that the .flow decoder reads it back the same way.
+//     Synthetic input also reaches codes a trained model never emits -- q2_0's 11 (= +2*d) appears here
+//     and does not appear in a checkpoint.
 //
 // Three windows per type, which take different paths through the reader:
 //   aligned        start 0, count 2*blck        -- exact whole blocks, lead 0
@@ -181,6 +183,20 @@ push(rr_names, "q1_0")
 push(rr_types, 41.0)
 push(rr_names, "q2_0")
 push(rr_types, 42.0)
+push(rr_names, "iq2_xxs")
+push(rr_types, 16.0)
+push(rr_names, "iq3_xxs")
+push(rr_types, 18.0)
+push(rr_names, "iq2_xs")
+push(rr_types, 17.0)
+push(rr_names, "iq3_s")
+push(rr_types, 21.0)
+push(rr_names, "iq2_s")
+push(rr_types, 22.0)
+push(rr_names, "iq1_s")
+push(rr_types, 19.0)
+push(rr_names, "iq1_m")
+push(rr_types, 29.0)
 
 let rr_dir = "stdlib/llm/testdata/"
 let rr_pack = rr_dir + "row_pack.bin"
