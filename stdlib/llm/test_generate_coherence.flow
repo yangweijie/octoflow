@@ -5,8 +5,9 @@
 // strings all come from the model under test, so pointing model_path at any small qwen2/llama GGUF
 // runs the same check. If the tokenizer splits " Paris" into pieces the check uses the first piece.
 //
-// Reference for the file below, from llama.cpp on the same bytes and the same token ids
-// (ref_scores --mode batch): argmax 12095 " Paris" at logit 18.26, i.e. rank 1.
+// Reference for the file below, from llama.cpp on the same bytes and the same token ids (one batched
+// llama_decode, logits read at the last prompt position): argmax 12095 " Paris" at logit 18.26, so the
+// correct rank is 1.
 //
 // What 1.5.8 actually produces on it, 2026-10-08, on Qwen2.5-0.5B F32:
 //
