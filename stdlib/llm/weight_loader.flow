@@ -13,8 +13,10 @@
 // Uses FLAT key API from gguf.flow — no nested maps.
 // Tensor info stored as: t.NAME.type, t.NAME.offset, t.NAME.count, etc.
 //
-// Decodes: F32, F16, BF16, Q8_0, Q5_0, Q4_K, Q6_K. The block layouts were checked
-// element-by-element against an F32 re-quant of the same file (stdlib/llm/test_dequant.flow).
+// Decodes: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K. Every block
+// layout was checked
+// element-by-element against ggml's own dequantization: stdlib/llm/test_dequant.flow for Q5_0,
+// Q8_0 and Q6_K, stdlib/llm/test_dequant_more.flow for Q4_0, Q4_1, Q5_1 and Q5_K.
 // Anything else, Q5_K and the IQ family included, stops with a message naming the tensor and its
 // type rather than returning zeros — for a whole tensor use the gguf_load_tensor() Rust builtin.
 //
@@ -183,6 +185,136 @@ fn dequant_q4k_block_m(buf, block_off)
     j = j + 1.0
   end
   return _dq4_out
+end
+
+// ── bit helper for the 5-bit formats ───────────────────────────
+// Shift-and-mask one byte at a time. Assembling the four qh bytes into one word would be wrong
+// here: numbers in this language are f32, so bits above the 24th would be discarded silently.
+fn bit_at_m(buf, off, shift)
+  let bit_byte = mem_get_u8(buf, off)
+  let mut bit_left = shift
+  let mut bit_cur = bit_byte
+  while bit_left > 0.0
+    bit_cur = floor(bit_cur / 2.0)
+    bit_left = bit_left - 1.0
+  end
+  return bit_cur - 2.0 * floor(bit_cur / 2.0)
+end
+
+// ── MEM-based Q4_0 / Q4_1 / Q5_1 / Q5_K dequant ────────────────
+
+fn dequant_q4_0_block_m(buf, block_off)
+  // 32 weights from 18 bytes: d f16 @0, qs[16] @2. Byte j carries weight j in its low nibble and
+  // weight j + 16 in its high nibble, so the two halves are emitted as two runs, not as pairs.
+  let q40_d = read_f16_le_m(buf, block_off)
+  let mut q40_out = []
+  let mut q40_j = 0.0
+  while q40_j < 16.0
+    let q40_b = mem_get_u8(buf, block_off + 2.0 + q40_j)
+    push(q40_out, q40_d * (q40_b - floor(q40_b / 16.0) * 16.0 - 8.0))
+    q40_j = q40_j + 1.0
+  end
+  let mut q40_k = 0.0
+  while q40_k < 16.0
+    let q40_b2 = mem_get_u8(buf, block_off + 2.0 + q40_k)
+    push(q40_out, q40_d * (floor(q40_b2 / 16.0) - 8.0))
+    q40_k = q40_k + 1.0
+  end
+  return q40_out
+end
+
+fn dequant_q4_1_block_m(buf, block_off)
+  // 32 weights from 20 bytes: d f16 @0, m f16 @2, qs[16] @4. Same half-and-half order as q4_0:
+  // x = d * q + m, low nibble first for weights 0..15, high nibble for 16..31.
+  let q41_d = read_f16_le_m(buf, block_off)
+  let q41_m = read_f16_le_m(buf, block_off + 2.0)
+  let mut q41_out = []
+  let mut q41_j = 0.0
+  while q41_j < 16.0
+    let q41_b = mem_get_u8(buf, block_off + 4.0 + q41_j)
+    push(q41_out, q41_d * (q41_b - floor(q41_b / 16.0) * 16.0) + q41_m)
+    q41_j = q41_j + 1.0
+  end
+  let mut q41_k = 0.0
+  while q41_k < 16.0
+    let q41_b2 = mem_get_u8(buf, block_off + 4.0 + q41_k)
+    push(q41_out, q41_d * floor(q41_b2 / 16.0) + q41_m)
+    q41_k = q41_k + 1.0
+  end
+  return q41_out
+end
+
+fn dequant_q5_1_block_m(buf, block_off)
+  // 32 weights from 24 bytes: d f16 @0, m f16 @2, h[4] @4 (the 5th bit of each weight), qs[16] @8.
+  // Weight j takes bit j of h and the low nibble of qs[j]; weight j + 16 takes bit j + 16 and the
+  // high nibble of qs[j]. The 5th bit is read per byte on purpose: numbers here are f32, so joining
+  // the four h bytes into one word would discard bits past the 24th.
+  let q51_d = read_f16_le_m(buf, block_off)
+  let q51_m = read_f16_le_m(buf, block_off + 2.0)
+  let mut q51_out = []
+  let mut q51_j = 0.0
+  while q51_j < 16.0
+    let q51_b = mem_get_u8(buf, block_off + 8.0 + q51_j)
+    let q51_gb = floor(q51_j / 8.0)
+    let q51_bit = bit_at_m(buf, block_off + 4.0 + q51_gb, q51_j - 8.0 * q51_gb)
+    push(q51_out, q51_d * (q51_b - floor(q51_b / 16.0) * 16.0 + 16.0 * q51_bit) + q51_m)
+    q51_j = q51_j + 1.0
+  end
+  let mut q51_k = 0.0
+  while q51_k < 16.0
+    let q51_pos = q51_k + 16.0
+    let q51_b2 = mem_get_u8(buf, block_off + 8.0 + q51_k)
+    let q51_gb2 = floor(q51_pos / 8.0)
+    let q51_bit2 = bit_at_m(buf, block_off + 4.0 + q51_gb2, q51_pos - 8.0 * q51_gb2)
+    push(q51_out, q51_d * (floor(q51_b2 / 16.0) + 16.0 * q51_bit2) + q51_m)
+    q51_k = q51_k + 1.0
+  end
+  return q51_out
+end
+
+fn dequant_q5_k_block_m(buf, block_off)
+  // 256 weights from 176 bytes, as dequantize_row_q5_K does: d f16 @0, dmin f16 @2, scales[12] @4,
+  // qh[32] @16, qs[128] @48. Four groups of 64 weights, two 32-weight sub-blocks each, sharing the
+  // same 32 qh bytes: group g takes bit 2g of qh[l] for the low nibble and bit 2g+1 for the high.
+  // The per-sub-block scale and min come from get_scale_min_k4, the same helper q4_K uses.
+  let q5k_d = read_f16_le_m(buf, block_off)
+  let q5k_min = read_f16_le_m(buf, block_off + 2.0)
+  let q5k_sc = block_off + 4.0
+  let q5k_qh = block_off + 16.0
+  let q5k_qs = block_off + 48.0
+  let mut q5k_out = []
+  let mut q5k_g = 0.0
+  let mut q5k_is = 0.0
+  while q5k_g < 4.0
+    let q5k_s1 = get_scale_min_k4_m(q5k_is, buf, q5k_sc)
+    let q5k_d1 = q5k_d * q5k_s1[0]
+    let q5k_m1 = q5k_min * q5k_s1[1]
+    let q5k_s2 = get_scale_min_k4_m(q5k_is + 1.0, buf, q5k_sc)
+    let q5k_d2 = q5k_d * q5k_s2[0]
+    let q5k_m2 = q5k_min * q5k_s2[1]
+    let q5k_b1 = 2.0 * q5k_g
+    let q5k_b2 = 2.0 * q5k_g + 1.0
+    let mut q5k_l = 0.0
+    while q5k_l < 32.0
+      let q5k_byte = mem_get_u8(buf, q5k_qs + q5k_g * 32.0 + q5k_l)
+      let q5k_lo = q5k_byte - floor(q5k_byte / 16.0) * 16.0
+      let q5k_hi = floor(q5k_byte / 16.0)
+      let q5k_h1 = bit_at_m(buf, q5k_qh + q5k_l, q5k_b1)
+      push(q5k_out, q5k_d1 * (q5k_lo + 16.0 * q5k_h1) - q5k_m1)
+      q5k_l = q5k_l + 1.0
+    end
+    let mut q5k_l2 = 0.0
+    while q5k_l2 < 32.0
+      let q5k_byte2 = mem_get_u8(buf, q5k_qs + q5k_g * 32.0 + q5k_l2)
+      let q5k_hi2 = floor(q5k_byte2 / 16.0)
+      let q5k_h2 = bit_at_m(buf, q5k_qh + q5k_l2, q5k_b2)
+      push(q5k_out, q5k_d2 * (q5k_hi2 + 16.0 * q5k_h2) - q5k_m2)
+      q5k_l2 = q5k_l2 + 1.0
+    end
+    q5k_is = q5k_is + 2.0
+    q5k_g = q5k_g + 1.0
+  end
+  return q5k_out
 end
 
 // ── MEM-based Q8_0 / Q5_0 / BF16 dequant ────────────────────────
@@ -460,6 +592,62 @@ fn load_tensor_from_file(file_path, model, tname)
       end
       b = b + 1.0
     end
+  elif ttype == 2.0
+    // Q4_0: 32 or 256 weights per block, 18.0 bytes each
+    let mut bq40 = 0.0
+    let mut blkq40 = 18.0
+    while bq40 < count / 32.0
+      let vq40 = dequant_q4_0_block_m(raw, blkq40)
+      let mut iq40 = 0.0
+      while iq40 < len(vq40)
+        push(result, vq40[int(iq40)])
+        iq40 = iq40 + 1.0
+      end
+      bq40 = bq40 + 1.0
+      blkq40 = blkq40 + 18.0
+    end
+  elif ttype == 3.0
+    // Q4_1: 32 or 256 weights per block, 20.0 bytes each
+    let mut bq41 = 0.0
+    let mut blkq41 = 20.0
+    while bq41 < count / 32.0
+      let vq41 = dequant_q4_1_block_m(raw, blkq41)
+      let mut iq41 = 0.0
+      while iq41 < len(vq41)
+        push(result, vq41[int(iq41)])
+        iq41 = iq41 + 1.0
+      end
+      bq41 = bq41 + 1.0
+      blkq41 = blkq41 + 20.0
+    end
+  elif ttype == 7.0
+    // Q5_1: 32 or 256 weights per block, 24.0 bytes each
+    let mut bq51 = 0.0
+    let mut blkq51 = 24.0
+    while bq51 < count / 32.0
+      let vq51 = dequant_q5_1_block_m(raw, blkq51)
+      let mut iq51 = 0.0
+      while iq51 < len(vq51)
+        push(result, vq51[int(iq51)])
+        iq51 = iq51 + 1.0
+      end
+      bq51 = bq51 + 1.0
+      blkq51 = blkq51 + 24.0
+    end
+  elif ttype == 13.0
+    // Q5_K: 32 or 256 weights per block, 176.0 bytes each
+    let mut bq5kb = 0.0
+    let mut blkq5kb = 176.0
+    while bq5kb < count / 256.0
+      let vq5kb = dequant_q5_k_block_m(raw, blkq5kb)
+      let mut iq5kb = 0.0
+      while iq5kb < len(vq5kb)
+        push(result, vq5kb[int(iq5kb)])
+        iq5kb = iq5kb + 1.0
+      end
+      bq5kb = bq5kb + 1.0
+      blkq5kb = blkq5kb + 176.0
+    end
   elif ttype == 14.0
     // Q6_K: 256 weights per 210-byte block, count may end mid-block
     let mut b6 = 0.0
@@ -478,7 +666,7 @@ fn load_tensor_from_file(file_path, model, tname)
       b6 = b6 + 1.0
     end
   else
-    assert(false, "load_tensor_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16, BF16, Q8_0, Q5_0, Q4_K and Q6_K)")
+    assert(false, "load_tensor_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K and Q6_K)")
   end
 
   mem_free(raw)

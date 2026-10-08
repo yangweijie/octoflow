@@ -1,0 +1,194 @@
+// Verifies the q4_0, q4_1, q5_1 and q5_k block decoders in stdlib/llm/weight_loader.flow against
+// ggml's own dequantization.
+//
+// Each testdata/<type>.bin is a 16-byte header (u32 block bytes, u32 values per block, u32 record
+// count) followed by records of [raw quantized block || the values ggml produced for it]. The
+// fixtures were generated on this machine from an all-F32 Qwen2.5-0.5B file:
+//
+//   llama-quantize --pure           qwen2.5-0.5b-f32.gguf  fix_q4_0.gguf  q4_0
+//   llama-quantize --pure --allow-requantize fix_q4_0.gguf  fix_q4_0_ora.gguf f32
+//
+// and then the block bytes from the first file and the matching floats from the second. data_start
+// is 5947712 for these files and was taken from OctoFlow's own parser (map_get(model,
+// "data_start")), not from the header walk that produced the tensor offsets -- a hand-rolled walk
+// under-reads the KV section and shifts every read by 16512 bytes, which is how the first version of
+// this fixture produced a q4_0 scale of 15.6875 for a transformer weight.
+//
+// Element order inside a block: ggml's quantize_row_q4_0_ref / dequantize_row_q4_0 put weight j in
+// the low nibble of qs[j] and weight j + 16 in the high nibble of the same byte, so the two halves
+// are two runs, not sixteen pairs. Getting this wrong still yields plausible-looking numbers (the
+// first version of these three decoders matched 13% of values), which is why they are checked
+// against ggml rather than against a reading of the layout.
+//
+// q5_k records come from blk.0.ffn_down.weight, not attn_q: llama-quantize --pure q5_k in this build
+// writes attn_q as q5_1 and leaves only 24 tensors as q5_K, so the q5_K bytes have to be taken from
+// one of those. Q8_1 is absent on purpose: this build rejects "q8_1" as an ftype, so there is no
+// ggml reference to compare against and the decoder is not implemented either.
+//
+// Run from the octoflow root so the relative fixture paths resolve, like every other stdlib test:
+//
+//   octoflow run stdlib/llm/test_dequant_more.flow --allow-read --allow-ffi
+//
+// Written flat with distinct names per type, as test_dequant.flow is: a helper's `let` shares a slot
+// with the caller's variable of the same name, so a loop counter reused across a helper boundary
+// would be corrupted rather than isolated.
+use "gguf"
+use "weight_loader"
+
+let dir = "stdlib/llm/testdata/"
+
+// ── q4_0: 18-byte blocks of 32 weights ─────────────────────────
+let p40 = dir + "q4_0.bin"
+let sz40 = file_size(p40)
+let b40 = mem_alloc(sz40)
+let _rd40 = file_read_into_mem(p40, b40, 0.0, sz40)
+let mut bad40 = 0.0
+let mut worst40 = 0.0
+let mut n40 = 0.0
+let mut o40 = 16.0
+while n40 < 64.0
+  let v40 = dequant_q4_0_block_m(b40, o40)
+  let mut k40 = 0.0
+  while k40 < 32.0
+    let r40 = mem_get_f32(b40, o40 + 18.0 + k40 * 4.0)
+    let g40 = v40[int(k40)]
+    let mut e40 = g40 - r40
+    if e40 < 0.0
+      e40 = e40 * -1.0
+    end
+    let mut a40 = r40
+    if a40 < 0.0
+      a40 = a40 * -1.0
+    end
+    if e40 > worst40
+      worst40 = e40
+    end
+    if e40 > a40 * 0.001 + 0.000000001
+      bad40 = bad40 + 1.0
+    end
+    k40 = k40 + 1.0
+  end
+  o40 = o40 + 146.0
+  n40 = n40 + 1.0
+end
+print("  q4_0: {bad40} of 2048 outside tolerance, worst abs diff {worst40}")
+
+// ── q4_1: 20-byte blocks of 32 weights ─────────────────────────
+let p41 = dir + "q4_1.bin"
+let sz41 = file_size(p41)
+let b41 = mem_alloc(sz41)
+let _rd41 = file_read_into_mem(p41, b41, 0.0, sz41)
+let mut bad41 = 0.0
+let mut worst41 = 0.0
+let mut n41 = 0.0
+let mut o41 = 16.0
+while n41 < 64.0
+  let v41 = dequant_q4_1_block_m(b41, o41)
+  let mut k41 = 0.0
+  while k41 < 32.0
+    let r41 = mem_get_f32(b41, o41 + 20.0 + k41 * 4.0)
+    let g41 = v41[int(k41)]
+    let mut e41 = g41 - r41
+    if e41 < 0.0
+      e41 = e41 * -1.0
+    end
+    let mut a41 = r41
+    if a41 < 0.0
+      a41 = a41 * -1.0
+    end
+    if e41 > worst41
+      worst41 = e41
+    end
+    if e41 > a41 * 0.001 + 0.000000001
+      bad41 = bad41 + 1.0
+    end
+    k41 = k41 + 1.0
+  end
+  o41 = o41 + 148.0
+  n41 = n41 + 1.0
+end
+print("  q4_1: {bad41} of 2048 outside tolerance, worst abs diff {worst41}")
+
+// ── q5_1: 24-byte blocks of 32 weights, 5th bit in h[4] ────────
+let p51 = dir + "q5_1.bin"
+let sz51 = file_size(p51)
+let b51 = mem_alloc(sz51)
+let _rd51 = file_read_into_mem(p51, b51, 0.0, sz51)
+let mut bad51 = 0.0
+let mut worst51 = 0.0
+let mut n51 = 0.0
+let mut o51 = 16.0
+while n51 < 64.0
+  let v51 = dequant_q5_1_block_m(b51, o51)
+  let mut k51 = 0.0
+  while k51 < 32.0
+    let r51 = mem_get_f32(b51, o51 + 24.0 + k51 * 4.0)
+    let g51 = v51[int(k51)]
+    let mut e51 = g51 - r51
+    if e51 < 0.0
+      e51 = e51 * -1.0
+    end
+    let mut a51 = r51
+    if a51 < 0.0
+      a51 = a51 * -1.0
+    end
+    if e51 > worst51
+      worst51 = e51
+    end
+    if e51 > a51 * 0.001 + 0.000000001
+      bad51 = bad51 + 1.0
+    end
+    k51 = k51 + 1.0
+  end
+  o51 = o51 + 152.0
+  n51 = n51 + 1.0
+end
+print("  q5_1: {bad51} of 2048 outside tolerance, worst abs diff {worst51}")
+
+// ── q5_k: 176-byte blocks of 256 weights, scales shared with q4_k ──
+let p5k = dir + "q5_k.bin"
+let sz5k = file_size(p5k)
+let b5k = mem_alloc(sz5k)
+let _rd5k = file_read_into_mem(p5k, b5k, 0.0, sz5k)
+let mut bad5k = 0.0
+let mut worst5k = 0.0
+let mut n5k = 0.0
+let mut o5k = 16.0
+while n5k < 8.0
+  let v5k = dequant_q5_k_block_m(b5k, o5k)
+  let mut k5k = 0.0
+  while k5k < 256.0
+    let r5k = mem_get_f32(b5k, o5k + 176.0 + k5k * 4.0)
+    let g5k = v5k[int(k5k)]
+    let mut e5k = g5k - r5k
+    if e5k < 0.0
+      e5k = e5k * -1.0
+    end
+    let mut a5k = r5k
+    if a5k < 0.0
+      a5k = a5k * -1.0
+    end
+    if e5k > worst5k
+      worst5k = e5k
+    end
+    if e5k > a5k * 0.001 + 0.000000001
+      bad5k = bad5k + 1.0
+    end
+    k5k = k5k + 1.0
+  end
+  o5k = o5k + 1200.0
+  n5k = n5k + 1.0
+end
+print("  q5_k: {bad5k} of 2048 outside tolerance, worst abs diff {worst5k}")
+
+let moretotal = bad40 + bad41 + bad51 + bad5k
+if moretotal == 0.0
+  print("DEQUANT DECODERS MATCH THE GGML ORACLE")
+end
+if moretotal > 0.0
+  print("DEQUANT FAILURES: {moretotal} values outside tolerance")
+end
+mem_free(b40)
+mem_free(b41)
+mem_free(b51)
+mem_free(b5k)
