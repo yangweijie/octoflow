@@ -292,7 +292,7 @@ print(" ")
 
 // ── Test 1: Load model metadata ──────────────────────────────────
 print("--- Test 1: Load model ---")
-let model = gguf_load("_test_e2e.gguf")
+let model = gguf_load_from_file("_test_e2e.gguf")
 
 let n_embd = gguf_meta(model, "embedding_length")
 let n_head = gguf_meta(model, "attention.head_count")
@@ -331,7 +331,7 @@ let _c19 = check_eq(counters, "has output.weight", gguf_has_tensor(model, "outpu
 
 // ── Test 3: Load embedding ───────────────────────────────────────
 print("--- Test 3: Load embedding ---")
-let bos_emb = load_embedding_row(file_bytes, model, 1.0, n_embd)
+let bos_emb = load_embedding_row_from_file("_test_e2e.gguf", model, 1.0, n_embd)
 let _c20 = check_eq(counters, "emb len=32", len(bos_emb), 32.0)
 // Row 1 should be 0.1*(1+1) = 0.2 in all positions
 let _c21 = check_near(counters, "emb[0]=0.2", bos_emb[0], 0.2, 0.01)
@@ -339,7 +339,7 @@ let _c22 = check_near(counters, "emb[31]=0.2", bos_emb[31], 0.2, 0.01)
 
 // ── Test 4: RMSNorm CPU with adaptive eps ────────────────────────
 print("--- Test 4: RMSNorm CPU ---")
-let norm_w = read_tensor_by_name(file_bytes, model, "blk.0.attn_norm.weight")
+let norm_w = read_tensor_by_name("_test_e2e.gguf", model, "blk.0.attn_norm.weight")
 let normed = rmsnorm_cpu(bos_emb, norm_w, N_EMBD, eps)
 let _c23 = check_eq(counters, "normed len=32", len(normed), 32.0)
 // All-same input with weight=1 → output should be all 1.0 (or close)
@@ -349,15 +349,15 @@ let _c24 = check_near(counters, "normed[0]~1.0", normed[0], 1.0, 0.01)
 // ── Test 5: Weight loading for all layer tensors ─────────────────
 print("--- Test 5: Weight loading ---")
 let prefix = "blk.0."
-let an = read_tensor_by_name(file_bytes, model, prefix + "attn_norm.weight")
-let wq = read_tensor_by_name(file_bytes, model, prefix + "attn_q.weight")
-let wk = read_tensor_by_name(file_bytes, model, prefix + "attn_k.weight")
-let wv = read_tensor_by_name(file_bytes, model, prefix + "attn_v.weight")
-let wo = read_tensor_by_name(file_bytes, model, prefix + "attn_output.weight")
-let fn_w = read_tensor_by_name(file_bytes, model, prefix + "ffn_norm.weight")
-let wg = read_tensor_by_name(file_bytes, model, prefix + "ffn_gate.weight")
-let wu = read_tensor_by_name(file_bytes, model, prefix + "ffn_up.weight")
-let wd = read_tensor_by_name(file_bytes, model, prefix + "ffn_down.weight")
+let an = read_tensor_by_name("_test_e2e.gguf", model, prefix + "attn_norm.weight")
+let wq = read_tensor_by_name("_test_e2e.gguf", model, prefix + "attn_q.weight")
+let wk = read_tensor_by_name("_test_e2e.gguf", model, prefix + "attn_k.weight")
+let wv = read_tensor_by_name("_test_e2e.gguf", model, prefix + "attn_v.weight")
+let wo = read_tensor_by_name("_test_e2e.gguf", model, prefix + "attn_output.weight")
+let fn_w = read_tensor_by_name("_test_e2e.gguf", model, prefix + "ffn_norm.weight")
+let wg = read_tensor_by_name("_test_e2e.gguf", model, prefix + "ffn_gate.weight")
+let wu = read_tensor_by_name("_test_e2e.gguf", model, prefix + "ffn_up.weight")
+let wd = read_tensor_by_name("_test_e2e.gguf", model, prefix + "ffn_down.weight")
 
 let _c25 = check_eq(counters, "norm len=32", len(an), 32.0)
 let _c26 = check_eq(counters, "wq len=1024", len(wq), 1024.0)
@@ -369,14 +369,14 @@ let _c29 = check_eq(counters, "down len=2048", len(wd), 2048.0)
 print("--- Test 6: Output logits ---")
 // With output.weight = identity matrix and normed hidden = all-same,
 // logits = normed_hidden dot each row of output.weight
-let out_norm = read_tensor_by_name(file_bytes, model, "output_norm.weight")
+let out_norm = read_tensor_by_name("_test_e2e.gguf", model, "output_norm.weight")
 let normed_out = rmsnorm_cpu(bos_emb, out_norm, N_EMBD, eps)
 
 // Output projection: dot product of normed_out with each output row
 let mut logits = []
 let mut vi = 0.0
 while vi < vocab_size
-  let row = load_embedding_row(file_bytes, model, vi, n_embd)
+  let row = load_embedding_row_from_file("_test_e2e.gguf", model, vi, n_embd)
   let mut dot = 0.0
   let mut di = 0.0
   while di < n_embd

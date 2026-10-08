@@ -1,309 +1,45 @@
-// stdlib/ai/weight_loader.flow — GGUF Weight Loader for LLM Inference
+// weight_loader.flow — GGUF Weight Loader for LLM Inference
 //
-// Loads quantized weights from GGUF file bytes, dequantizes to F32,
-// and builds weight maps compatible with transformer.flow.
+// Reads tensors straight from the GGUF file through a Rust MEM buffer, dequantizes to F32, and
+// hands arrays back to the caller. One block decoder per ggml format: this module used to carry a
+// second set of readers that decoded from an in-memory byte array, and the two copies of the same
+// format drifted (the Q6_K row decoder was the one that survived longest). The byte-array set is
+// gone; everything reads through the file.
+//
+// A model map parsed from an in-memory byte array (gguf_load_from_bytes) cannot drive these readers:
+// they resolve a tensor offset through the parser MEM buffers (_hdr_buf/_ds_buf), which only
+// gguf_load_from_file fills. Write the bytes out and parse the file if you need weights from it.
 //
 // Uses FLAT key API from gguf.flow — no nested maps.
 // Tensor info stored as: t.NAME.type, t.NAME.offset, t.NAME.count, etc.
 //
-// Supports:
-//   - F32 tensors (norm weights, small tensors)
-//   - F16, BF16 tensors (embedding, output)
-//   - Q4_K_M tensors (bulk weights) — CPU dequant, GPU dequant later
-//   - Q5_0, Q6_K, Q8_0 tensors (file-based functions only) — these three block layouts plus
-//     F32/F16/BF16 were checked element-by-element against an F32 re-quant of the same file
-//   - Q5_K tensors — use gguf_load_tensor() Rust builtin (v1.5.0+)
+// Decodes: F32, F16, BF16, Q8_0, Q5_0, Q4_K, Q6_K. The block layouts were checked
+// element-by-element against an F32 re-quant of the same file (stdlib/llm/test_dequant.flow).
+// Anything else, Q5_K and the IQ family included, stops with a message naming the tensor and its
+// type rather than returning zeros — for a whole tensor use the gguf_load_tensor() Rust builtin.
 //
-// Functions:
-//   load_layer_weights(file_bytes, model, layer_idx) → weight map
-//   load_embedding_row(file_bytes, model, token_id, n_embd) → float array
-//   load_output_norm(file_bytes, model) → float array
-//   load_output_proj(file_bytes, model) → float array
-//   read_tensor_by_name(file_bytes, model, tname) → float array
+// Functions (first argument is always the GGUF file path):
+//   load_tensor_from_file(file_path, model, tname) → float array, whole tensor
+//   load_embedding_row_from_file(file_path, model, token_id, n_embd) → one embedding row
+//   load_tensor_row_from_file(file_path, model, tname, row_idx, row_size) → one row of any 2-D tensor
+//   load_output_norm(file_path, model) → float array
+//   load_output_proj(file_path, model) → float array (falls back to the tied embedding table)
+//   read_tensor_by_name(file_path, model, tname) → float array
 //
 // Requirements: --allow-read (for GGUF file access)
 
 use "../formats/gguf"
 
-// ── Q4_K Dequantization (CPU) ──────────────────────────────────
-
-fn get_scale_min_k4(j, bytes, scales_off)
-  // Decode 6-bit scale and min from Q4_K 12-byte scales field
-  // Returns [scale, min] as 2-element array
-  let mut sm = [0.0, 0.0]
-
-  if j < 4.0
-    // Simple case: direct 6-bit values
-    let d_val = bytes[int(scales_off + j)]
-    // d = q[j] & 63
-    let d = d_val - floor(d_val / 64.0) * 64.0
-    let m_val = bytes[int(scales_off + j + 4.0)]
-    // m = q[j+4] & 63
-    let m = m_val - floor(m_val / 64.0) * 64.0
-    sm[0] = d
-    sm[1] = m
-  else
-    // Complex case: split across bytes
-    let qj4 = bytes[int(scales_off + j + 4.0)]
-    let qj_4 = bytes[int(scales_off + j - 4.0)]
-    let qj0 = bytes[int(scales_off + j)]
-    // d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4)
-    let low_d = qj4 - floor(qj4 / 16.0) * 16.0
-    let high_d = floor(qj_4 / 64.0)
-    sm[0] = low_d + high_d * 16.0
-    // m = (q[j+4] >> 4) | ((q[j] >> 6) << 4)
-    let low_m = floor(qj4 / 16.0)
-    let high_m = floor(qj0 / 64.0)
-    sm[1] = low_m + high_m * 16.0
-  end
-
-  return sm
-end
-
-fn dequant_q4k_block(bytes, block_off)
-  // Dequantize one Q4_K block: 256 weights from 144 bytes
-  // Layout: d(f16, 2B) + dmin(f16, 2B) + scales(12B) + qs(128B) = 144
-  let d = read_f16_le(bytes, block_off)
-  let dmin = read_f16_le(bytes, block_off + 2.0)
-  let scales_off = block_off + 4.0
-  let qs_off = block_off + 16.0
-
-  let mut _dq4_out = []
-  let mut is_idx = 0.0
-  let mut q_off = qs_off
-
-  // 4 iterations x 64 weights = 256 weights
-  let mut j = 0.0
-  while j < 4.0
-    // Get scale/min for sub-block pair
-    let sm1 = get_scale_min_k4(is_idx, bytes, scales_off)
-    let d1 = d * sm1[0]
-    let m1 = dmin * sm1[1]
-
-    let sm2 = get_scale_min_k4(is_idx + 1.0, bytes, scales_off)
-    let d2 = d * sm2[0]
-    let m2 = dmin * sm2[1]
-
-    // 32 weights from low nibbles
-    let mut l = 0.0
-    while l < 32.0
-      let q_byte = bytes[int(q_off + l)]
-      let q_low = q_byte - floor(q_byte / 16.0) * 16.0
-      push(_dq4_out, d1 * q_low - m1)
-      l = l + 1.0
-    end
-
-    // 32 weights from high nibbles
-    let mut l2 = 0.0
-    while l2 < 32.0
-      let q_byte2 = bytes[int(q_off + l2)]
-      let q_high = floor(q_byte2 / 16.0)
-      push(_dq4_out, d2 * q_high - m2)
-      l2 = l2 + 1.0
-    end
-
-    q_off = q_off + 32.0
-    is_idx = is_idx + 2.0
-    j = j + 1.0
-  end
-
-  return _dq4_out
-end
-
-fn dequant_q4k_tensor(bytes, abs_offset, n_elements)
-  // Dequantize full Q4_K tensor to F32
-  let block_size = 256.0
-  let block_bytes = 144.0
-  let n_blocks = ceil(n_elements / block_size)
-
-  let mut _dqt_out = []
-  let mut b = 0.0
-  while b < n_blocks
-    let bo = abs_offset + b * block_bytes
-    let block_data = dequant_q4k_block(bytes, bo)
-
-    // Copy block (possibly partial for last block)
-    let remaining = n_elements - b * block_size
-    let mut copy_count = block_size
-    if remaining < copy_count
-      copy_count = remaining
-    end
-
-    let mut ci = 0.0
-    while ci < copy_count
-      push(_dqt_out, block_data[int(ci)])
-      ci = ci + 1.0
-    end
-
-    b = b + 1.0
-  end
-
-  return _dqt_out
-end
-
-// ── F16 Tensor Loading ─────────────────────────────────────────
-
-fn load_f16_tensor(bytes, abs_offset, n_elements)
-  // Load F16 tensor, convert each to F32
-  let mut _f16_out = []
-  let mut i = 0.0
-  while i < n_elements
-    let f = read_f16_le(bytes, abs_offset + i * 2.0)
-    push(_f16_out, f)
-    i = i + 1.0
-  end
-  return _f16_out
-end
-
-// ── Generic Tensor Loading (flat key API) ──────────────────────
-
-fn load_tensor_named(file_bytes, model, tname)
-  // Load tensor by name using flat keys in model map
-  // Auto-dispatches F32/F16/Q4_K based on tensor type
-  let data_start = map_get(model, "data_start")
-  let prefix = "t." + tname
-  let ttype = map_get(model, prefix + ".type")
-  let offset = data_start + map_get(model, prefix + ".offset")
-  let count = map_get(model, prefix + ".count")
-
-  if ttype == 0.0
-    // F32: read directly
-    let mut _ltn_out = []
-    let mut i = 0.0
-    while i < count
-      let f = read_f32_le_bytes(file_bytes, offset + i * 4.0)
-      push(_ltn_out, f)
-      i = i + 1.0
-    end
-    return _ltn_out
-  elif ttype == 1.0
-    // F16
-    return load_f16_tensor(file_bytes, offset, count)
-  elif ttype == 12.0
-    // Q4_K
-    return dequant_q4k_tensor(file_bytes, offset, count)
-  end
-
-  // No decoder exists for this type. Zeros would reach the caller as a correctly shaped weight
-  // carrying no information, which is the failure mode this loader must not hide.
-  assert(false, "load_tensor_named: no decoder for ggml type " + str(ttype) + " of " + tname + " (this loader implements F32, F16 and Q4_K)")
-  return []
-end
-
-// ── Tensor Name Builder ────────────────────────────────────────
-
-fn tensor_name(layer_idx, suffix)
-  // Build GGUF tensor name: "blk.{N}.{suffix}"
-  return "blk." + str(layer_idx) + "." + suffix
-end
-
 // ── Layer Weight Loading ───────────────────────────────────────
-// NOTE: OctoFlow maps can only store scalars (Float/Str), NOT arrays.
-// So we cannot bundle weight arrays into a map. Instead, callers load
-// each weight individually with read_tensor_by_name():
-//
-//   let attn_norm = read_tensor_by_name(file_bytes, model, "blk.0.attn_norm.weight")
-//   let wq = read_tensor_by_name(file_bytes, model, "blk.0.attn_q.weight")
-//   // ... pass arrays directly to GPU functions
+// NOTE: OctoFlow maps can only store scalars (Float/Str), NOT arrays. So weights are not
+// bundled into a map; each one is read by name with read_tensor_by_name() and passed on
+// directly. Every format below has exactly one block decoder, in the MEM section.
 
-// ── Embedding Row Loading ──────────────────────────────────────
-
-fn load_embedding_row(file_bytes, model, token_id, n_embd)
-  // Load one row from the embedding table
-  let data_start = map_get(model, "data_start")
-  let emb_name = "token_embd.weight"
-
-  if gguf_has_tensor(model, emb_name) == 0.0
-    print("ERROR: token_embd.weight not found")
-    let mut zeros = []
-    let mut i = 0.0
-    while i < n_embd
-      push(zeros, 0.0)
-      i = i + 1.0
-    end
-    return zeros
-  end
-
-  let ttype = gguf_tensor_type(model, emb_name)
-  let base_offset = data_start + gguf_tensor_offset(model, emb_name)
-
-  // Row offset depends on quantization type
-  if ttype == 0.0
-    // F32: row_offset = token_id * n_embd * 4
-    let row_offset = base_offset + token_id * n_embd * 4.0
-    let mut row = []
-    let mut i = 0.0
-    while i < n_embd
-      let f = read_f32_le_bytes(file_bytes, row_offset + i * 4.0)
-      push(row, f)
-      i = i + 1.0
-    end
-    return row
-  elif ttype == 1.0
-    // F16: row_offset = token_id * n_embd * 2
-    let row_offset = base_offset + token_id * n_embd * 2.0
-    let mut row = []
-    let mut i = 0.0
-    while i < n_embd
-      let f = read_f16_le(file_bytes, row_offset + i * 2.0)
-      push(row, f)
-      i = i + 1.0
-    end
-    return row
-  elif ttype == 12.0
-    // Q4_K: need to find correct block and extract row
-    let block_size = 256.0
-    let block_bytes = 144.0
-    let weight_idx = token_id * n_embd
-    let block_idx = floor(weight_idx / block_size)
-
-    // Dequant the entire block(s) containing this row
-    let weights_start = block_idx * block_size
-    let weights_end = weight_idx + n_embd
-    let blocks_needed = ceil((weights_end - weights_start) / block_size)
-
-    let mut all_weights = []
-    let mut b = 0.0
-    while b < blocks_needed
-      let bo = base_offset + (block_idx + b) * block_bytes
-      let bdata = dequant_q4k_block(file_bytes, bo)
-      let mut bi = 0.0
-      while bi < 256.0
-        push(all_weights, bdata[int(bi)])
-        bi = bi + 1.0
-      end
-      b = b + 1.0
-    end
-
-    // Extract the row from dequantized data
-    let local_start = weight_idx - weights_start
-    let mut row = []
-    let mut i = 0.0
-    while i < n_embd
-      push(row, all_weights[int(local_start + i)])
-      i = i + 1.0
-    end
-    return row
-  end
-
-  // Unsupported type — Q5_K/Q6_K embeddings need gguf_load_tensor()
-  print("WARNING: Unsupported embedding type {ttype} — use gguf_load_tensor() for Q5_K/Q6_K")
-  let mut zeros = []
-  let mut zi = 0.0
-  while zi < n_embd
-    push(zeros, 0.0)
-    zi = zi + 1.0
-  end
-  return zeros
-end
-
-// ── Output Weights Loading ─────────────────────────────────────
-
-fn load_output_norm(file_bytes, model)
+fn load_output_norm(file_path, model)
   // Load final RMSNorm weights
   let norm_name = "output_norm.weight"
   if gguf_has_tensor(model, norm_name) == 1.0
-    return load_tensor_named(file_bytes, model, norm_name)
+    return load_tensor_from_file(file_path, model, norm_name)
   end
 
   print("WARNING: output_norm.weight not found")
@@ -311,36 +47,41 @@ fn load_output_norm(file_bytes, model)
   return _empty_arr
 end
 
-fn load_output_proj(file_bytes, model)
+fn load_output_proj(file_path, model)
   // Load lm_head projection weights (vocab x n_embd)
   let out_name = "output.weight"
   if gguf_has_tensor(model, out_name) == 1.0
-    return load_tensor_named(file_bytes, model, out_name)
+    return load_tensor_from_file(file_path, model, out_name)
   end
 
   // Some models tie embedding and output weights
   let emb_name = "token_embd.weight"
   if gguf_has_tensor(model, emb_name) == 1.0
     print("NOTE: Using tied embedding weights for output projection")
-    return load_tensor_named(file_bytes, model, emb_name)
+    return load_tensor_from_file(file_path, model, emb_name)
   end
 
   print("WARNING: output.weight not found")
-  let mut _empty_arr = []
-  return _empty_arr
+  let mut _empty_arr2 = []
+  return _empty_arr2
 end
 
-// ── Convenience: Read tensor by name from model ────────────────
+// ── Convenience: Read tensor by name ───────────────────────────
 
-fn read_tensor_by_name(file_bytes, model, tname)
-  // Load a specific tensor from GGUF model by name
+fn read_tensor_by_name(file_path, model, tname)
   if gguf_has_tensor(model, tname) == 1.0
-    return load_tensor_named(file_bytes, model, tname)
+    return load_tensor_from_file(file_path, model, tname)
   end
 
   print("WARNING: tensor not found: {tname}")
   let mut _ea2 = []
   return _ea2
+end
+
+
+fn tensor_name(layer_idx, suffix)
+  // Build GGUF tensor name: "blk.{N}.{suffix}"
+  return "blk." + str(layer_idx) + "." + suffix
 end
 
 // ══════════════════════════════════════════════════════════════════════
@@ -749,14 +490,10 @@ end
 fn load_embedding_row_from_file(file_path, model, token_id, n_embd)
   let emb_name = "token_embd.weight"
   if gguf_has_tensor(model, emb_name) == 0.0
-    print("ERROR: token_embd.weight not found")
-    let mut zeros = []
-    let mut i = 0.0
-    while i < n_embd
-      push(zeros, 0.0)
-      i = i + 1.0
-    end
-    return zeros
+    // A zero row is a correctly shaped embedding that says nothing about the token, which is the
+    // failure mode this loader exists not to hide.
+    assert(false, "load_embedding_row_from_file: token_embd.weight not found in this model")
+    return []
   end
 
   let ttype = gguf_tensor_type(model, emb_name)
