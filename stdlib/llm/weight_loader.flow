@@ -17,7 +17,7 @@
 // TQ1_0, TQ2_0 and Q2_0_g128 (PQ2_0). Every block layout was checked
 // element-by-element against ggml's own dequantization: stdlib/llm/test_dequant.flow for Q5_0,
 // Q8_0 and Q6_K, stdlib/llm/test_dequant_more.flow for Q4_0, Q4_1, Q5_1 and Q5_K.
-// Anything else, Q5_K and the IQ family included, stops with a message naming the tensor and its
+// Rows and slices go through load_element_range_from_file, which covers the same type list.
 // type rather than returning zeros — for a whole tensor use the gguf_load_tensor() Rust builtin.
 //
 // Functions (first argument is always the GGUF file path):
@@ -1068,6 +1068,148 @@ end
 
 // ── Load embedding row from file ─────────────────────────────────
 
+// ── Row / slice loading, one window algorithm for every decoded type ─
+//
+// A row of a 2-D tensor is a contiguous element range, so reading it needs exactly three things: the
+// block geometry of the type (from gguf_type_geometry), the byte range of the blocks that cover the
+// range, and the block decoder. All three are already in this module, so the window logic lives here
+// once instead of once per type per entry point -- the duplication this replaced is how a wrong Q6_K
+// row decoder survived a release (see the branch notes), and the two copies below used to implement
+// only four types each while thirteen block decoders existed.
+//
+// Element and byte positions go through MEM u64 arithmetic (mem_set_u64 / mem_u64_add), never through
+// .flow numbers: offsets above 2^24 are not representable as f32 and would round silently.
+fn load_element_range_from_file(file_path, off_buf, elem_start, elem_count, ttype)
+  let lge_geo = gguf_type_geometry(ttype)
+  if len(lge_geo) == 0.0
+    assert(false, "load_element_range_from_file: no geometry for ggml type " + str(ttype))
+    return []
+  end
+  let lge_blck = lge_geo[0.0]
+  let lge_bb = lge_geo[1.0]
+
+  // Every position below is a .flow number, i.e. an f32, so it is only exact while it is below
+  // 2^24. That is a property of the row path this replaces, not a regression: the old code computed
+  // token_id * n_embd * 4 the same way and silently rounded once a row began past ~16.7M elements,
+  // which is token 18,680 of an 896-wide embedding. The difference is that it now says so.
+  if elem_start + elem_count > 16777216.0
+    assert(false, "load_element_range_from_file: element range " + str(elem_start) + ".." + str(elem_start + elem_count) + " exceeds the 2^24 exact range of .flow numbers; use gguf_load_tensor() for rows that far into a tensor")
+    return []
+  end
+
+  // Round out to whole blocks and remember how many leading elements to discard.
+  let lge_first = floor(elem_start / lge_blck)
+  let lge_lead = elem_start - lge_first * lge_blck
+  let lge_nblk = ceil((lge_lead + elem_count) / lge_blck)
+
+  let lge_boff = mem_alloc(8)
+  mem_set_u64(lge_boff, 0.0, lge_first * lge_bb)
+  let lge_abs = mem_alloc(8)
+  let _cp = mem_copy(off_buf, 0.0, lge_abs, 0.0, 8)
+  let _ad = mem_u64_add(lge_abs, 0.0, lge_boff, 0.0)
+  mem_free(lge_boff)
+
+  let lge_bytes = lge_nblk * lge_bb
+  // lge_first * lge_bb stays under 2^24 for the same reason; checked above via the range
+  let lge_raw = mem_alloc(lge_bytes)
+  let _rd = file_read_into_mem_u64(file_path, lge_raw, lge_abs, 0.0, lge_bytes)
+  mem_free(lge_abs)
+
+  let mut lge_out = []
+  if lge_blck == 1.0
+    // Unquantized: the geometry says one element per "block", so read the range element-wise.
+    let mut lge_i = 0.0
+    while lge_i < elem_count
+      let lge_e = (lge_i + lge_lead) * lge_bb
+      if ttype == 0.0
+        push(lge_out, bits_to_float(mem_get_u32(lge_raw, lge_e)))
+      elif ttype == 1.0
+        push(lge_out, read_f16_le_m(lge_raw, lge_e))
+      elif ttype == 30.0
+        let lge_b0 = mem_get_u8(lge_raw, lge_e)
+        let lge_b1 = mem_get_u8(lge_raw, lge_e + 1.0)
+        push(lge_out, bits_to_float((lge_b0 + lge_b1 * 256.0) * 65536.0))
+      else
+        assert(false, "load_element_range_from_file: no element reader for ggml type " + str(ttype))
+      end
+      lge_i = lge_i + 1.0
+    end
+    mem_free(lge_raw)
+    return lge_out
+  end
+
+  let mut lge_b = 0.0
+  while lge_b < lge_nblk
+    let mut lge_vb = []
+    let mut lge_hit = 0.0
+    let lge_bo = lge_b * lge_bb
+    if ttype == 2.0
+      lge_vb = dequant_q4_0_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 3.0
+      lge_vb = dequant_q4_1_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 6.0
+      lge_vb = dequant_q5_0_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 7.0
+      lge_vb = dequant_q5_1_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 8.0
+      lge_vb = dequant_q8_0_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 10.0
+      lge_vb = dequant_q2_k_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 11.0
+      lge_vb = dequant_q3_k_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 12.0
+      lge_vb = dequant_q4k_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 13.0
+      lge_vb = dequant_q5_k_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 14.0
+      lge_vb = dequant_q6_k_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 20.0
+      lge_vb = dequant_iq4_nl_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 34.0
+      lge_vb = dequant_tq1_0_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 35.0
+      lge_vb = dequant_tq2_0_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    elif ttype == 142.0
+      lge_vb = dequant_q2_0_g128_block_m(lge_raw, lge_bo)
+      lge_hit = 1.0
+    end
+    if lge_hit == 0.0
+      mem_free(lge_raw)
+      assert(false, "load_element_range_from_file: no block decoder for ggml type " + str(ttype) + " (geometry " + str(lge_blck) + " weights per " + str(lge_bb) + " bytes)")
+      return []
+    end
+    let mut lge_iv = 0.0
+    while lge_iv < len(lge_vb)
+      push(lge_out, lge_vb[int(lge_iv)])
+      lge_iv = lge_iv + 1.0
+    end
+    lge_b = lge_b + 1.0
+  end
+  mem_free(lge_raw)
+
+  // Discard the leading elements the range did not ask for, then take elem_count of what is left.
+  let mut lge_res = []
+  let mut lge_k = lge_lead
+  while lge_k < lge_lead + elem_count
+    push(lge_res, lge_out[int(lge_k)])
+    lge_k = lge_k + 1.0
+  end
+  return lge_res
+end
+
 fn load_embedding_row_from_file(file_path, model, token_id, n_embd)
   let emb_name = "token_embd.weight"
   if gguf_has_tensor(model, emb_name) == 0.0
@@ -1076,268 +1218,24 @@ fn load_embedding_row_from_file(file_path, model, token_id, n_embd)
     assert(false, "load_embedding_row_from_file: token_embd.weight not found in this model")
     return []
   end
-
   let ttype = gguf_tensor_type(model, emb_name)
   let off_buf = gguf_tensor_file_offset(model, emb_name)
-
-  if ttype == 0.0
-    // F32: read one row (token_id * n_embd * 4 bytes)
-    let row_byte_off = token_id * n_embd * 4.0
-    // Add row offset to file offset
-    let row_off = mem_alloc(8)
-    mem_set_u64(row_off, 0.0, row_byte_off)
-    let _a = mem_u64_add(off_buf, 0.0, row_off, 0.0)
-    mem_free(row_off)
-
-    let row_bytes = n_embd * 4.0
-    let raw = mem_alloc(row_bytes)
-    let _rd = file_read_into_mem_u64(file_path, raw, off_buf, 0.0, row_bytes)
-    mem_free(off_buf)
-
-    let mut row = []
-    let mut i = 0.0
-    while i < n_embd
-      let f = bits_to_float(mem_get_u32(raw, i * 4.0))
-      push(row, f)
-      i = i + 1.0
-    end
-    mem_free(raw)
-    return row
-  elif ttype == 1.0
-    // F16: row_offset = token_id * n_embd * 2
-    let row_byte_off = token_id * n_embd * 2.0
-    let row_off = mem_alloc(8)
-    mem_set_u64(row_off, 0.0, row_byte_off)
-    let _a = mem_u64_add(off_buf, 0.0, row_off, 0.0)
-    mem_free(row_off)
-
-    let row_bytes = n_embd * 2.0
-    let raw = mem_alloc(row_bytes)
-    let _rd = file_read_into_mem_u64(file_path, raw, off_buf, 0.0, row_bytes)
-    mem_free(off_buf)
-
-    let mut row = []
-    let mut i = 0.0
-    while i < n_embd
-      let f = read_f16_le_m(raw, i * 2.0)
-      push(row, f)
-      i = i + 1.0
-    end
-    mem_free(raw)
-    return row
-  elif ttype == 12.0
-    // Q4_K: find the block(s) containing this row
-    let block_size = 256.0
-    let block_bytes = 144.0
-    let weight_idx = token_id * n_embd
-    let block_idx = floor(weight_idx / block_size)
-    let weights_end = weight_idx + n_embd
-    let blocks_needed = ceil((weights_end - block_idx * block_size) / block_size)
-
-    // Read just the needed blocks
-    let read_bytes_count = blocks_needed * block_bytes
-    let block_byte_off = block_idx * block_bytes
-    let blk_off = mem_alloc(8)
-    mem_set_u64(blk_off, 0.0, block_byte_off)
-    let _a = mem_u64_add(off_buf, 0.0, blk_off, 0.0)
-    mem_free(blk_off)
-
-    let raw = mem_alloc(read_bytes_count)
-    let _rd = file_read_into_mem_u64(file_path, raw, off_buf, 0.0, read_bytes_count)
-    mem_free(off_buf)
-
-    // Dequant and extract row
-    let mut all_weights = []
-    let mut b = 0.0
-    while b < blocks_needed
-      let bo = b * block_bytes
-      let bdata = dequant_q4k_block_m(raw, bo)
-      let mut bi = 0.0
-      while bi < 256.0
-        push(all_weights, bdata[int(bi)])
-        bi = bi + 1.0
-      end
-      b = b + 1.0
-    end
-    mem_free(raw)
-
-    let local_start = weight_idx - block_idx * block_size
-    let mut row = []
-    let mut i = 0.0
-    while i < n_embd
-      push(row, all_weights[int(local_start + i)])
-      i = i + 1.0
-    end
-    return row
-  elif ttype == 14.0
-    let q6_block_bytes = 210.0
-    let weight_idx = token_id * n_embd
-    let block_idx = floor(weight_idx / 256.0)
-    let blocks_needed = ceil((weight_idx + n_embd - block_idx * 256.0) / 256.0)
-    let blk_off = mem_alloc(8)
-    mem_set_u64(blk_off, 0.0, block_idx * q6_block_bytes)
-    let _a = mem_u64_add(off_buf, 0.0, blk_off, 0.0)
-    mem_free(blk_off)
-    let raw = mem_alloc(blocks_needed * q6_block_bytes)
-    let _rd = file_read_into_mem_u64(file_path, raw, off_buf, 0.0, blocks_needed * q6_block_bytes)
-    mem_free(off_buf)
-    let mut all_weights = []
-    let mut blki = 0.0
-    while blki < blocks_needed
-      let vals6 = dequant_q6_k_block_m(raw, blki * q6_block_bytes)
-      let mut vi6 = 0.0
-      while vi6 < 256.0
-        push(all_weights, vals6[int(vi6)])
-        vi6 = vi6 + 1.0
-      end
-      blki = blki + 1.0
-    end
-    mem_free(raw)
-    let local_start = weight_idx - block_idx * 256.0
-    let mut row = []
-    let mut i = 0.0
-    while i < n_embd
-      push(row, all_weights[int(local_start + i)])
-      i = i + 1.0
-    end
-    return row
-  end
-
+  let row = load_element_range_from_file(file_path, off_buf, token_id * n_embd, n_embd, ttype)
   mem_free(off_buf)
-  assert(false, "load_embedding_row_from_file: no decoder for ggml type " + str(ttype) + " of " + emb_name + " (this path implements F32, F16, Q4_K and Q6_K)")
-  return []
+  return row
 end
-
-// ── Generic tensor row loader ─────────────────────────────────────
-// Loads row `row_idx` (of `row_size` elements) from tensor `tname`.
-// Works for any GGUF tensor — parameterized version of load_embedding_row_from_file.
-// Used by streaming matmul for CPU-only inference (O(row_size) memory per call).
 
 fn load_tensor_row_from_file(file_path, model, tname, row_idx, row_size)
   if gguf_has_tensor(model, tname) == 0.0
-    print("ERROR: tensor not found: {tname}")
-    let mut _trz = []
-    let mut _zi = 0.0
-    while _zi < row_size
-      push(_trz, 0.0)
-      _zi = _zi + 1.0
-    end
-    return _trz
+    print("WARNING: tensor not found: {tname}")
+    let mut _rt0 = []
+    return _rt0
   end
-
   let ttype = gguf_tensor_type(model, tname)
   let off_buf = gguf_tensor_file_offset(model, tname)
-
-  if ttype == 0.0
-    let row_byte_off = row_idx * row_size * 4.0
-    let row_off = mem_alloc(8)
-    mem_set_u64(row_off, 0.0, row_byte_off)
-    let _a = mem_u64_add(off_buf, 0.0, row_off, 0.0)
-    mem_free(row_off)
-    let row_bytes = row_size * 4.0
-    let raw = mem_alloc(row_bytes)
-    let _rd = file_read_into_mem_u64(file_path, raw, off_buf, 0.0, row_bytes)
-    mem_free(off_buf)
-    let mut _trf = []
-    let mut _ti = 0.0
-    while _ti < row_size
-      push(_trf, bits_to_float(mem_get_u32(raw, _ti * 4.0)))
-      _ti = _ti + 1.0
-    end
-    mem_free(raw)
-    return _trf
-  elif ttype == 1.0
-    let row_byte_off = row_idx * row_size * 2.0
-    let row_off = mem_alloc(8)
-    mem_set_u64(row_off, 0.0, row_byte_off)
-    let _a = mem_u64_add(off_buf, 0.0, row_off, 0.0)
-    mem_free(row_off)
-    let row_bytes = row_size * 2.0
-    let raw = mem_alloc(row_bytes)
-    let _rd = file_read_into_mem_u64(file_path, raw, off_buf, 0.0, row_bytes)
-    mem_free(off_buf)
-    let mut _trf = []
-    let mut _ti = 0.0
-    while _ti < row_size
-      push(_trf, read_f16_le_m(raw, _ti * 2.0))
-      _ti = _ti + 1.0
-    end
-    mem_free(raw)
-    return _trf
-  elif ttype == 12.0
-    let block_size = 256.0
-    let block_bytes = 144.0
-    let weight_idx = row_idx * row_size
-    let block_idx = floor(weight_idx / block_size)
-    let weights_end = weight_idx + row_size
-    let blocks_needed = ceil((weights_end - block_idx * block_size) / block_size)
-    let read_bytes_count = blocks_needed * block_bytes
-    let block_byte_off = block_idx * block_bytes
-    let blk_off = mem_alloc(8)
-    mem_set_u64(blk_off, 0.0, block_byte_off)
-    let _a = mem_u64_add(off_buf, 0.0, blk_off, 0.0)
-    mem_free(blk_off)
-    let raw = mem_alloc(read_bytes_count)
-    let _rd = file_read_into_mem_u64(file_path, raw, off_buf, 0.0, read_bytes_count)
-    mem_free(off_buf)
-    let mut _trw = []
-    let mut b = 0.0
-    while b < blocks_needed
-      let bo = b * block_bytes
-      let bdata = dequant_q4k_block_m(raw, bo)
-      let mut bi = 0.0
-      while bi < 256.0
-        push(_trw, bdata[int(bi)])
-        bi = bi + 1.0
-      end
-      b = b + 1.0
-    end
-    mem_free(raw)
-    let local_start = weight_idx - block_idx * block_size
-    let mut _trf = []
-    let mut _ti = 0.0
-    while _ti < row_size
-      push(_trf, _trw[int(local_start + _ti)])
-      _ti = _ti + 1.0
-    end
-    return _trf
-  elif ttype == 14.0
-    let q6_block_bytes = 210.0
-    let weight_idx = row_idx * row_size
-    let block_idx = floor(weight_idx / 256.0)
-    let blocks_needed = ceil((weight_idx + row_size - block_idx * 256.0) / 256.0)
-    let blk_off = mem_alloc(8)
-    mem_set_u64(blk_off, 0.0, block_idx * q6_block_bytes)
-    let _a = mem_u64_add(off_buf, 0.0, blk_off, 0.0)
-    mem_free(blk_off)
-    let raw = mem_alloc(blocks_needed * q6_block_bytes)
-    let _rd = file_read_into_mem_u64(file_path, raw, off_buf, 0.0, blocks_needed * q6_block_bytes)
-    mem_free(off_buf)
-    let mut _trw = []
-    let mut blki = 0.0
-    while blki < blocks_needed
-      let vals6 = dequant_q6_k_block_m(raw, blki * q6_block_bytes)
-      let mut vi6 = 0.0
-      while vi6 < 256.0
-        push(_trw, vals6[int(vi6)])
-        vi6 = vi6 + 1.0
-      end
-      blki = blki + 1.0
-    end
-    mem_free(raw)
-    let local_start = weight_idx - block_idx * 256.0
-    let mut _trf = []
-    let mut _ti = 0.0
-    while _ti < row_size
-      push(_trf, _trw[int(local_start + _ti)])
-      _ti = _ti + 1.0
-    end
-    return _trf
-  end
-
+  let row = load_element_range_from_file(file_path, off_buf, row_idx * row_size, row_size, ttype)
   mem_free(off_buf)
-  assert(false, "load_tensor_row_from_file: no decoder for ggml type " + str(ttype) + " of " + tname + " (this path implements F32, F16, Q4_K and Q6_K)")
-  return []
+  return row
 end
 
 // ══════════════════════════════════════════════════════════════════════
