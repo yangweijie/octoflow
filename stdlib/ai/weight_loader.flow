@@ -511,10 +511,11 @@ fn q3k_scale_at(buf, sc_off, idx)
 end
 
 fn dequant_q3_k_block_m(buf, block_off)
-  // 256 weights from 110 bytes: hmask[32] @0, qs[64] @32, scales[12] @96, d f16 @108. Two passes of
-  // 128 weights; the 2-bit field shift restarts each pass but the hmask bit position keeps advancing
-  // (dequantize_row_q3_K declares m outside the n loop), which is what makes one bit per weight land
-  // on the right element.
+  // 256 weights from 110 bytes: hmask[32] @0, qs[64] @32, scales[12] @96, d f16 @108. For weight e of
+  // the block the 3rd bit comes from hmask[e mod 32] at bit (e div 32), and the 2-bit field from
+  // qs[32 + (e div 128)*32 + (e mod 32)] at shift 2*((e div 32) mod 4): the field shift restarts for
+  // each 128-weight pass while the hmask bit keeps advancing, because dequantize_row_q3_K declares m
+  // outside the n loop. That is what puts one bit per weight on the right element.
   let q3_d = read_f16_le_m(buf, block_off + 108.0)
   let q3_sc = block_off + 96.0
   let mut q3_out = []
