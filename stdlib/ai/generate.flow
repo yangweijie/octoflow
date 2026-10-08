@@ -248,6 +248,16 @@ print("Loading embedding table + output norm...")
 let actual_vocab = map_get(model, "t.token_embd.weight.dim1")
 let out_norm_w = gguf_load_tensor(model_path, model, "output_norm.weight")
 
+// The output projection is the embedding table only for a tied model. When the file carries a
+// separate output.weight, projecting through token_embd.weight multiplies the hidden state by a
+// matrix of the wrong shape and the logits are meaningless.
+let mut lm_head = "token_embd.weight"
+let has_lm_head = gguf_has_tensor(model, "output.weight")
+if has_lm_head == 1.0
+  lm_head = "output.weight"
+end
+print("  output projection: {lm_head}")
+
 // Get EOS token
 let mut eos_id = 2.0
 if map_has(model, "kv.tokenizer.ggml.eos_token_id")
@@ -313,7 +323,7 @@ while seq_pos < total_steps
   else
     // Last prefill position or generation: compute logits + select
     let normed_out = rmsnorm_cpu(hidden, out_norm_w, n_embd, eps)
-    let logits = gguf_matvec(model_path, model, "token_embd.weight", normed_out)
+    let logits = gguf_matvec(model_path, model, lm_head, normed_out)
 
     let mut sampled_idx = 0.0
     let mut sampled_logit = -999999.0

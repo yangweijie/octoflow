@@ -103,6 +103,16 @@ fn run_generate(model_path, prompt)
   print("Loading output norm...")
   let out_norm_w = gguf_load_tensor(model_path, model, "output_norm.weight")
 
+  // The output projection is the embedding table only for a tied model. When the file carries a
+  // separate output.weight, projecting through token_embd.weight multiplies the hidden state by a
+  // matrix of the wrong shape and the logits are meaningless.
+  let mut lm_head = "token_embd.weight"
+  let has_lm_head = gguf_has_tensor(model, "output.weight")
+  if has_lm_head == 1.0
+    lm_head = "output.weight"
+  end
+  print("  output projection: {lm_head}")
+
   // KV cache is managed in Rust (gguf_infer_layer auto-initializes on first call)
   print("KV cache: Rust-managed (auto-initialized)")
 
@@ -160,7 +170,7 @@ fn run_generate(model_path, prompt)
     else
       // Last prefill position or generation: compute logits + select
       let normed_out = rmsnorm_cpu(hidden, out_norm_w, n_embd, eps)
-      let logits = gguf_matvec(model_path, model, "token_embd.weight", normed_out)
+      let logits = gguf_matvec(model_path, model, lm_head, normed_out)
 
       let mut sampled_idx = 0.0
       if strategy == "greedy"

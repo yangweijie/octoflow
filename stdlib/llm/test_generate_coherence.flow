@@ -108,7 +108,12 @@ fn coherence_check(model_path)
   end
 
   let normed = rmsnorm_cpu(hidden, out_norm_w, n_embd, eps)
-  let logits = gguf_matvec(model_path, model, "token_embd.weight", normed)
+  let mut lm_head = "token_embd.weight"
+  let has_lm_head = gguf_has_tensor(model, "output.weight")
+  if has_lm_head == 1.0
+    lm_head = "output.weight"
+  end
+  let logits = gguf_matvec(model_path, model, lm_head, normed)
 
   let answer_logit = logits[int(answer_id)]
   let above = count_greater(logits, answer_logit)
