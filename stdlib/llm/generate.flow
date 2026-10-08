@@ -36,7 +36,10 @@ fn run_generate(model_path, prompt)
 
   let n_embd = map_get(model, "n_embd")
   let n_head = map_get(model, "n_head")
-  let mut n_kv_head = map_get(model, "n_kv_head")
+  // map_get throws on a missing key, so the "== 0.0" fallback below could never be reached: a model
+  // that genuinely has no key-value head count (plain MHA, or an architecture whose metadata the
+  // parser does not normalize under that name) died here instead of defaulting to n_head.
+  let mut n_kv_head = gguf_meta_default(model, "n_kv_head", 0.0)
   let n_ff = map_get(model, "n_ff")
   let n_layer = map_get(model, "n_layer")
   let vocab_size = map_get(model, "vocab_size")

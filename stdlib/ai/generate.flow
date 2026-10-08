@@ -158,7 +158,7 @@ let model = gguf_load_from_file(model_path)
 
 let n_embd = map_get(model, "n_embd")
 let n_head = map_get(model, "n_head")
-let mut n_kv_head = map_get(model, "n_kv_head")
+let mut n_kv_head = gguf_meta_default(model, "n_kv_head", 0.0)
 let n_ff = map_get(model, "n_ff")
 let n_layer = map_get(model, "n_layer")
 let vocab_size = map_get(model, "vocab_size")
