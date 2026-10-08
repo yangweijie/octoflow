@@ -904,7 +904,7 @@ fn load_tensor_from_file(file_path, model, tname)
   elif ttype == 2.0
     // Q4_0: 32 or 256 weights per block, 18.0 bytes each
     let mut bq40 = 0.0
-    let mut blkq40 = 18.0
+    let mut blkq40 = 0.0
     while bq40 < count / 32.0
       let vq40 = dequant_q4_0_block_m(raw, blkq40)
       let mut iq40 = 0.0
@@ -918,7 +918,7 @@ fn load_tensor_from_file(file_path, model, tname)
   elif ttype == 3.0
     // Q4_1: 32 or 256 weights per block, 20.0 bytes each
     let mut bq41 = 0.0
-    let mut blkq41 = 20.0
+    let mut blkq41 = 0.0
     while bq41 < count / 32.0
       let vq41 = dequant_q4_1_block_m(raw, blkq41)
       let mut iq41 = 0.0
@@ -932,7 +932,7 @@ fn load_tensor_from_file(file_path, model, tname)
   elif ttype == 7.0
     // Q5_1: 32 or 256 weights per block, 24.0 bytes each
     let mut bq51 = 0.0
-    let mut blkq51 = 24.0
+    let mut blkq51 = 0.0
     while bq51 < count / 32.0
       let vq51 = dequant_q5_1_block_m(raw, blkq51)
       let mut iq51 = 0.0
@@ -946,7 +946,7 @@ fn load_tensor_from_file(file_path, model, tname)
   elif ttype == 13.0
     // Q5_K: 32 or 256 weights per block, 176.0 bytes each
     let mut bq5kb = 0.0
-    let mut blkq5kb = 176.0
+    let mut blkq5kb = 0.0
     while bq5kb < count / 256.0
       let vq5kb = dequant_q5_k_block_m(raw, blkq5kb)
       let mut iq5kb = 0.0
