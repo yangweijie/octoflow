@@ -73,10 +73,15 @@ failures = failures + count_failure(expect_geometry(29.0, 256.0, 56.0, "iq1_m"))
 failures = failures + count_failure(expect_geometry(34.0, 256.0, 54.0, "tq1_0"))
 failures = failures + count_failure(expect_geometry(35.0, 256.0, 66.0, "tq2_0"))
 
+// ── Prism's group-128 Q2_0 is a real type with a real block ───
+failures = failures + count_failure(expect_geometry(142.0, 128.0, 34.0, "q2_0_g128"))
+
 // ── a type outside ggml's enum must have no geometry ──────────
-let unknown = gguf_type_geometry(142.0)
+// 43..141 are unassigned in this ggml build and 143 is past GGML_TYPE_COUNT, so neither may size to
+// anything: an unknown type has to stay unknown rather than fall through to a guessed F32 row.
+let unknown = gguf_type_geometry(143.0)
 let unknown_len = len(unknown)
-print("type 142 (prism q2_0_g128) geometry entries: {unknown_len}")
+print("type 143 (past ggml's enum) geometry entries: {unknown_len}")
 failures = failures + count_failure(unknown_len == 0.0)
 
 // ── regression on the sizes that were already correct ─────────

@@ -1,4 +1,4 @@
-// Verifies the q4_0, q4_1, q5_1, q5_k, q2_k, tq1_0 and tq2_0 block decoders in stdlib/llm/weight_loader.flow
+// Verifies the q4_0, q4_1, q5_1, q5_k, q2_k, tq1_0, tq2_0 and q2_0_g128 block decoders in stdlib/llm/weight_loader.flow
 // against ggml's own dequantization.
 //
 // Each testdata/<type>.bin is a 16-byte header (u32 block bytes, u32 values per block, u32 record
@@ -309,7 +309,43 @@ while ntq2_0 < 8.0
 end
 print("  tq2_0: {badtq2_0} of 2048 outside tolerance, worst abs diff {worsttq2_0}")
 mem_free(btq2_0)
-let moretotal = bad40 + bad41 + bad51 + bad5k + bad2k + badtq1_0 + badtq2_0
+// ── q2_0_g128: 34-byte blocks of 128 weights (PQ2_0) ──
+let pg1 = dir + "q2_0_g128.bin"
+let szg1 = file_size(pg1)
+let bg1 = mem_alloc(szg1)
+let _rdg1 = file_read_into_mem(pg1, bg1, 0.0, szg1)
+let mut badg1 = 0.0
+let mut worstg1 = 0.0
+let mut ng1 = 0.0
+let mut og1 = 16.0
+while ng1 < 16.0
+  let vg1 = dequant_q2_0_g128_block_m(bg1, og1)
+  let mut kg1 = 0.0
+  while kg1 < 128.0
+    let rg1 = mem_get_f32(bg1, og1 + 34.0 + kg1 * 4.0)
+    let gg1 = vg1[int(kg1)]
+    let mut eg1 = gg1 - rg1
+    if eg1 < 0.0
+      eg1 = eg1 * -1.0
+    end
+    let mut ag1 = rg1
+    if ag1 < 0.0
+      ag1 = ag1 * -1.0
+    end
+    if eg1 > worstg1
+      worstg1 = eg1
+    end
+    if eg1 > ag1 * 0.001 + 0.000000001
+      badg1 = badg1 + 1.0
+    end
+    kg1 = kg1 + 1.0
+  end
+  og1 = og1 + 546.0
+  ng1 = ng1 + 1.0
+end
+print("  q2_0_g128: {badg1} of 2048 outside tolerance, worst abs diff {worstg1}")
+mem_free(bg1)
+let moretotal = bad40 + bad41 + bad51 + bad5k + bad2k + badtq1_0 + badtq2_0 + badg1
 if moretotal == 0.0
   print("DEQUANT DECODERS MATCH THE GGML ORACLE")
 end

@@ -82,6 +82,9 @@ let GGUF_TENSOR_MXFP4   = 39.0
 let GGUF_TENSOR_NVFP4   = 40.0
 let GGUF_TENSOR_Q1_0    = 41.0
 let GGUF_TENSOR_Q2_0    = 42.0
+// Prism-private group-128 Q2_0, aka PQ2_0: same 2-bit codec as Q2_0 but one fp16 scale per 128
+// weights, and a type number above the upstream enum (ggml 142, QK_K-independent block of 34 B).
+let GGUF_TENSOR_Q2_0_G128 = 142.0
 
 // ── Helper: Read bytes as little-endian values ──────────────────────
 
@@ -1045,6 +1048,8 @@ fn gguf_type_geometry(ttype)
     return [256.0, 56.0]
   elif ttype == GGUF_TENSOR_TQ1_0
     return [256.0, 54.0]
+  elif ttype == GGUF_TENSOR_Q2_0_G128
+    return [128.0, 34.0]
   end
   return []
 end
