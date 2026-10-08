@@ -1,4 +1,4 @@
-// Verifies the q4_0, q4_1, q5_1, q5_k and q2_k block decoders in stdlib/llm/weight_loader.flow
+// Verifies the q4_0, q4_1, q5_1, q5_k, q2_k, tq1_0 and tq2_0 block decoders in stdlib/llm/weight_loader.flow
 // against ggml's own dequantization.
 //
 // Each testdata/<type>.bin is a 16-byte header (u32 block bytes, u32 values per block, u32 record
@@ -237,7 +237,79 @@ end
 print("  q2_k: {bad2k} of 2048 outside tolerance, worst abs diff {worst2k}")
 
 mem_free(b2k)
-let moretotal = bad40 + bad41 + bad51 + bad5k + bad2k
+// ── tq1_0: 54-byte blocks of 256 ternary weights ──
+let ptq1_0 = dir + "tq1_0.bin"
+let sztq1_0 = file_size(ptq1_0)
+let btq1_0 = mem_alloc(sztq1_0)
+let _rdtq1_0 = file_read_into_mem(ptq1_0, btq1_0, 0.0, sztq1_0)
+let mut badtq1_0 = 0.0
+let mut worsttq1_0 = 0.0
+let mut ntq1_0 = 0.0
+let mut otq1_0 = 16.0
+while ntq1_0 < 8.0
+  let vtq1_0 = dequant_tq1_0_block_m(btq1_0, otq1_0)
+  let mut ktq1_0 = 0.0
+  while ktq1_0 < 256.0
+    let rtq1_0 = mem_get_f32(btq1_0, otq1_0 + 54.0 + ktq1_0 * 4.0)
+    let gtq1_0 = vtq1_0[int(ktq1_0)]
+    let mut etq1_0 = gtq1_0 - rtq1_0
+    if etq1_0 < 0.0
+      etq1_0 = etq1_0 * -1.0
+    end
+    let mut atq1_0 = rtq1_0
+    if atq1_0 < 0.0
+      atq1_0 = atq1_0 * -1.0
+    end
+    if etq1_0 > worsttq1_0
+      worsttq1_0 = etq1_0
+    end
+    if etq1_0 > atq1_0 * 0.001 + 0.000000001
+      badtq1_0 = badtq1_0 + 1.0
+    end
+    ktq1_0 = ktq1_0 + 1.0
+  end
+  otq1_0 = otq1_0 + 1078.0
+  ntq1_0 = ntq1_0 + 1.0
+end
+print("  tq1_0: {badtq1_0} of 2048 outside tolerance, worst abs diff {worsttq1_0}")
+mem_free(btq1_0)
+// ── tq2_0: 66-byte blocks of 256 ternary weights ──
+let ptq2_0 = dir + "tq2_0.bin"
+let sztq2_0 = file_size(ptq2_0)
+let btq2_0 = mem_alloc(sztq2_0)
+let _rdtq2_0 = file_read_into_mem(ptq2_0, btq2_0, 0.0, sztq2_0)
+let mut badtq2_0 = 0.0
+let mut worsttq2_0 = 0.0
+let mut ntq2_0 = 0.0
+let mut otq2_0 = 16.0
+while ntq2_0 < 8.0
+  let vtq2_0 = dequant_tq2_0_block_m(btq2_0, otq2_0)
+  let mut ktq2_0 = 0.0
+  while ktq2_0 < 256.0
+    let rtq2_0 = mem_get_f32(btq2_0, otq2_0 + 66.0 + ktq2_0 * 4.0)
+    let gtq2_0 = vtq2_0[int(ktq2_0)]
+    let mut etq2_0 = gtq2_0 - rtq2_0
+    if etq2_0 < 0.0
+      etq2_0 = etq2_0 * -1.0
+    end
+    let mut atq2_0 = rtq2_0
+    if atq2_0 < 0.0
+      atq2_0 = atq2_0 * -1.0
+    end
+    if etq2_0 > worsttq2_0
+      worsttq2_0 = etq2_0
+    end
+    if etq2_0 > atq2_0 * 0.001 + 0.000000001
+      badtq2_0 = badtq2_0 + 1.0
+    end
+    ktq2_0 = ktq2_0 + 1.0
+  end
+  otq2_0 = otq2_0 + 1090.0
+  ntq2_0 = ntq2_0 + 1.0
+end
+print("  tq2_0: {badtq2_0} of 2048 outside tolerance, worst abs diff {worsttq2_0}")
+mem_free(btq2_0)
+let moretotal = bad40 + bad41 + bad51 + bad5k + bad2k + badtq1_0 + badtq2_0
 if moretotal == 0.0
   print("DEQUANT DECODERS MATCH THE GGML ORACLE")
 end
